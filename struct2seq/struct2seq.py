@@ -1,4 +1,4 @@
-from __future__ import print_function
+from __future__ import annotations, print_function
 
 import numpy as np
 from matplotlib import pyplot as plt
@@ -8,14 +8,19 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .self_attention import *
+from .self_attention import (
+    TransformerLayer,
+    MPNNLayer,
+    cat_neighbors_nodes,
+    gather_nodes,
+)
 from .protein_features import ProteinFeatures
 
 class Struct2Seq(nn.Module):
-    def __init__(self, num_letters, node_features, edge_features,
-        hidden_dim, num_encoder_layers=3, num_decoder_layers=3,
-        vocab=20, k_neighbors=30, protein_features='full', augment_eps=0.,
-        dropout=0.1, forward_attention_decoder=True, use_mpnn=False):
+    def __init__(self, num_letters: int, node_features: int, edge_features: int,
+        hidden_dim: int, num_encoder_layers: int = 3, num_decoder_layers: int = 3,
+        vocab: int = 20, k_neighbors: int = 30, protein_features: str = 'full', augment_eps: float = 0.,
+        dropout: float = 0.1, forward_attention_decoder: bool = True, use_mpnn: bool = False) -> None:
         """ Graph labeling network """
         super(Struct2Seq, self).__init__()
 
@@ -56,7 +61,7 @@ class Struct2Seq(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    def _autoregressive_mask(self, E_idx):
+    def _autoregressive_mask(self, E_idx: torch.Tensor) -> torch.Tensor:
         N_nodes = E_idx.size(1)
         ii = torch.arange(N_nodes)
         ii = ii.view((1, -1, 1))
@@ -72,7 +77,7 @@ class Struct2Seq(nn.Module):
         # plt.show()
         return mask
 
-    def forward(self, X, S, L, mask):
+    def forward(self, X: torch.Tensor, S: torch.Tensor, L: np.ndarray, mask: torch.Tensor) -> torch.Tensor:
         """ Graph-conditioned sequence model """
 
         # Prepare node and edge embeddings
@@ -115,7 +120,7 @@ class Struct2Seq(nn.Module):
         log_probs = F.log_softmax(logits, dim=-1)
         return log_probs
 
-    def forward_sequential(self, X, S, L, mask=None):
+    def forward_sequential(self, X: torch.Tensor, S: torch.Tensor, L: np.ndarray, mask: torch.Tensor | None = None) -> torch.Tensor:
         """ Compute the transformer layer sequentially, for purposes of debugging
 
             TODO: Rewrite this and self.sample() to use a shared iterator
@@ -167,7 +172,7 @@ class Struct2Seq(nn.Module):
             h_S[:,t,:] = self.W_s(S[:,t])
         return log_probs
 
-    def sample(self, X, L, mask=None, temperature=1.0):
+    def sample(self, X: torch.Tensor, L: np.ndarray, mask: torch.Tensor | None = None, temperature: float = 1.0) -> torch.Tensor:
         """ Autoregressive decoding of a model """
          # Prepare node and edge embeddings
         V, E, E_idx = self.features(X, L, mask)

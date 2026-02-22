@@ -1,12 +1,15 @@
-from __future__ import print_function
+from __future__ import annotations, print_function
+
+from typing import Any, Callable, Iterator
+
 from torch.utils.data import Dataset
 import numpy as np
 import json, time, copy
 import random
 
 class StructureDataset():
-    def __init__(self, jsonl_file, verbose=True, truncate=None, max_length=100,
-        alphabet='ACDEFGHIKLMNPQRSTVWY'):
+    def __init__(self, jsonl_file: str, verbose: bool = True, truncate: int | None = None, max_length: int = 100,
+        alphabet: str = 'ACDEFGHIKLMNPQRSTVWY') -> None:
         alphabet_set = set([a for a in alphabet])
         discard_count = {
             'bad_chars': 0,
@@ -47,16 +50,16 @@ class StructureDataset():
                     print('{} entries ({} loaded) in {:.1f} s'.format(len(self.data), i+1, elapsed))
 
             print('Discarded', discard_count)
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.data)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int) -> dict[str, Any]:
         return self.data[idx]
 
 
 class SequenceDataset():
-    def __init__(self, jsonl_file, verbose=True, truncate=None, max_length=100,
-        alphabet='ACDEFGHIKLMNPQRSTVWY'):
+    def __init__(self, jsonl_file: str, verbose: bool = True, truncate: int | None = None, max_length: int = 100,
+        alphabet: str = 'ACDEFGHIKLMNPQRSTVWY') -> None:
         alphabet_set = set([a for a in alphabet])
         discard_count = {
             'bad_chars': 0,
@@ -90,16 +93,16 @@ class SequenceDataset():
                     print('{} entries ({} loaded) in {:.1f} s'.format(len(self.data), i+1, elapsed))
 
             print('Discarded', discard_count)
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.data)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int) -> dict[str, str]:
         return self.data[idx]
 
 
 class StructureLoader():
-    def __init__(self, dataset, batch_size=100, shuffle=True,
-        collate_fn=lambda x:x, drop_last=False):
+    def __init__(self, dataset: Any, batch_size: int = 100, shuffle: bool = True,
+        collate_fn: Callable[[list[Any]], Any] = lambda x:x, drop_last: bool = False) -> None:
         self.dataset = dataset
         self.size = len(dataset)
         self.lengths = [len(dataset[i]['seq']) for i in range(self.size)]
@@ -121,10 +124,10 @@ class StructureLoader():
             clusters.append(batch)
         self.clusters = clusters
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.clusters)
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[list[dict[str, Any]]]:
         np.random.shuffle(self.clusters)
         for b_idx in self.clusters:
             batch = [self.dataset[i] for i in b_idx]

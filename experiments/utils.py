@@ -12,7 +12,7 @@ from torch.utils.data.dataset import random_split, Subset
 
 # Library code
 sys.path.insert(0, '..')
-from struct2seq import *
+from struct2seq import struct2seq, seq_model
 
 from argparse import ArgumentParser
 

@@ -1,4 +1,4 @@
-from __future__ import print_function
+from __future__ import annotations, print_function
 
 import torch
 import torch.nn as nn
@@ -12,12 +12,12 @@ from matplotlib import pyplot as plt
 from .self_attention import gather_edges, gather_nodes, Normalize
 
 class PositionalEncodings(nn.Module):
-    def __init__(self, num_embeddings, period_range=[2,1000]):
+    def __init__(self, num_embeddings: int, period_range: list[int] = [2,1000]) -> None:
         super(PositionalEncodings, self).__init__()
         self.num_embeddings = num_embeddings
         self.period_range = period_range 
 
-    def forward(self, E_idx):
+    def forward(self, E_idx: torch.Tensor) -> torch.Tensor:
         # i-j
         N_batch = E_idx.size(0)
         N_nodes = E_idx.size(1)
@@ -42,8 +42,8 @@ class PositionalEncodings(nn.Module):
         return E
 
 class ProteinFeatures(nn.Module):
-    def __init__(self, edge_features, node_features, num_positional_embeddings=16,
-        num_rbf=16, top_k=30, features_type='full', augment_eps=0., dropout=0.1):
+    def __init__(self, edge_features: int, node_features: int, num_positional_embeddings: int = 16,
+        num_rbf: int = 16, top_k: int = 30, features_type: str = 'full', augment_eps: float = 0., dropout: float = 0.1) -> None:
         """ Extract protein features """
         super(ProteinFeatures, self).__init__()
         self.edge_features = edge_features
@@ -73,7 +73,7 @@ class ProteinFeatures(nn.Module):
         self.norm_nodes = Normalize(node_features)
         self.norm_edges = Normalize(edge_features)
 
-    def _dist(self, X, mask, eps=1E-6):
+    def _dist(self, X: torch.Tensor, mask: torch.Tensor, eps: float = 1E-6) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """ Pairwise euclidean distances """
         # Convolutional network on NCHW
         mask_2D = torch.unsqueeze(mask,1) * torch.unsqueeze(mask,2)
@@ -100,7 +100,7 @@ class ProteinFeatures(nn.Module):
         # exit(0)
         return D_neighbors, E_idx, mask_neighbors
 
-    def _rbf(self, D):
+    def _rbf(self, D: torch.Tensor) -> torch.Tensor:
         # Distance radial basis function
         D_min, D_max, D_count = 0., 20., self.num_rbf
         D_mu = torch.linspace(D_min, D_max, D_count)
@@ -122,7 +122,7 @@ class ProteinFeatures(nn.Module):
         # exit(0)
         return RBF
 
-    def _quaternions(self, R):
+    def _quaternions(self, R: torch.Tensor) -> torch.Tensor:
         """ Convert a batch of 3D rotations [R] to quaternions [Q]
             R [...,3,3]
             Q [...,4]
@@ -169,13 +169,13 @@ class ProteinFeatures(nn.Module):
         # axis = F.normalize(torch.cross(v1, v2), dim=-1)
         return Q
 
-    def _contacts(self, D_neighbors, E_idx, mask_neighbors, cutoff=8):
+    def _contacts(self, D_neighbors: torch.Tensor, E_idx: torch.Tensor, mask_neighbors: torch.Tensor, cutoff: float = 8) -> torch.Tensor:
         """ Contacts """
         D_neighbors = D_neighbors.unsqueeze(-1)
         neighbor_C = mask_neighbors * (D_neighbors < cutoff).type(torch.float32)
         return neighbor_C
 
-    def _hbonds(self, X, E_idx, mask_neighbors, eps=1E-3):
+    def _hbonds(self, X: torch.Tensor, E_idx: torch.Tensor, mask_neighbors: torch.Tensor, eps: float = 1E-3) -> torch.Tensor:
         """ Hydrogen bonds and contact map
         """
         X_atoms = dict(zip(['N', 'CA', 'C', 'O'], torch.unbind(X, 2)))
@@ -187,10 +187,10 @@ class ProteinFeatures(nn.Module):
           +  F.normalize(X_atoms['N'] - X_atoms['CA'], -1)
         , -1)
 
-        def _distance(X_a, X_b):
+        def _distance(X_a: torch.Tensor, X_b: torch.Tensor) -> torch.Tensor:
             return torch.norm(X_a[:,None,:,:] - X_b[:,:,None,:], dim=-1)
 
-        def _inv_distance(X_a, X_b):
+        def _inv_distance(X_a: torch.Tensor, X_b: torch.Tensor) -> torch.Tensor:
             return 1. / (_distance(X_a, X_b) + eps)
 
         # DSSP vacuum electrostatics model
@@ -218,7 +218,7 @@ class ProteinFeatures(nn.Module):
         # exit(0)
         return neighbor_HB
 
-    def _orientations_coarse(self, X, E_idx, eps=1e-6):
+    def _orientations_coarse(self, X: torch.Tensor, E_idx: torch.Tensor, eps: float = 1e-6) -> tuple[torch.Tensor, torch.Tensor]:
         # Pair features
 
         # Shifted slices of unit vectors
@@ -291,7 +291,7 @@ class ProteinFeatures(nn.Module):
         # print(Q.sum(), dU.sum(), R.sum())
         return AD_features, O_features
 
-    def _dihedrals(self, X, eps=1e-7):
+    def _dihedrals(self, X: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
         # First 3 coordinates are N, CA, C
         X = X[:,:,:3,:].reshape(X.shape[0], 3*X.shape[1], 3)
 
@@ -336,7 +336,7 @@ class ProteinFeatures(nn.Module):
         D_features = torch.cat((torch.cos(D), torch.sin(D)), 2)
         return D_features
 
-    def forward(self, X, L, mask):
+    def forward(self, X: torch.Tensor, L: np.ndarray, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """ Featurize coordinates as an attributed graph """
 
         # Data augmentation

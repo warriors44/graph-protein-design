@@ -1,4 +1,4 @@
-from __future__ import print_function
+from __future__ import annotations, print_function
 
 from matplotlib import pyplot as plt
 import numpy as np
@@ -12,7 +12,7 @@ from .self_attention import TransformerLayer, Normalize, gather_nodes, gather_ed
 from .protein_features import PositionalEncodings
 
 class LanguageRNN(nn.Module):
-    def __init__(self, num_letters, hidden_dim, vocab=20, num_layers=2):
+    def __init__(self, num_letters: int, hidden_dim: int, vocab: int = 20, num_layers: int = 2) -> None:
         """ Graph labeling network """
         super(LanguageRNN, self).__init__()
 
@@ -31,7 +31,7 @@ class LanguageRNN(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    def forward(self, S, L, mask=None):
+    def forward(self, S: torch.Tensor, L: np.ndarray, mask: torch.Tensor | None = None) -> torch.Tensor:
         """ Build a representation of each position in a sequence """
         h_S = self.W_s(S)
         h_V = torch.zeros([S.size(0), S.size(1), self.hidden_dim], dtype=torch.float32)
@@ -42,8 +42,8 @@ class LanguageRNN(nn.Module):
         return log_probs
 
 class SequenceModel(nn.Module):
-    def __init__(self, num_letters, hidden_dim, num_layers=3,
-        vocab=20, top_k=30, num_positional_embeddings=16):
+    def __init__(self, num_letters: int, hidden_dim: int, num_layers: int = 3,
+        vocab: int = 20, top_k: int = 30, num_positional_embeddings: int = 16) -> None:
         """ Graph labeling network """
         super(SequenceModel, self).__init__()
 
@@ -68,7 +68,7 @@ class SequenceModel(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    def _build_indices(self, S):
+    def _build_indices(self, S: torch.Tensor) -> torch.Tensor:
         k = self.top_k
         N_nodes = S.size(1)
         di = (torch.arange(k) + 1).view((1, 1, -1))
@@ -80,7 +80,7 @@ class SequenceModel(nn.Module):
         E_idx = E_idx.expand(S.size(0), -1,-1)
         return E_idx
 
-    def _autoregressive_mask(self, E_idx):
+    def _autoregressive_mask(self, E_idx: torch.Tensor) -> torch.Tensor:
         N_nodes = E_idx.size(1)
         ii = torch.arange(N_nodes)
         ii = ii.view((1, -1, 1))
@@ -95,7 +95,7 @@ class SequenceModel(nn.Module):
         # plt.show()
         return mask
 
-    def forward(self, S, L, mask=None):
+    def forward(self, S: torch.Tensor, L: np.ndarray, mask: torch.Tensor | None = None) -> torch.Tensor:
         """ Build a representation of each position in a sequence """
         # V, E, E_idx = self.features(X, L, mask)
         E_idx = self._build_indices(S)

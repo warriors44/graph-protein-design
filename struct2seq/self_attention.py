@@ -1,4 +1,4 @@
-from __future__ import print_function
+from __future__ import annotations, print_function
 
 import numpy as np
 from matplotlib import pyplot as plt
@@ -8,13 +8,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # The following gather functions
-def gather_edges(edges, neighbor_idx):
+def gather_edges(edges: torch.Tensor, neighbor_idx: torch.Tensor) -> torch.Tensor:
     # Features [B,N,N,C] at Neighbor indices [B,N,K] => Neighbor features [B,N,K,C]
     neighbors = neighbor_idx.unsqueeze(-1).expand(-1, -1, -1, edges.size(-1))
     edge_features = torch.gather(edges, 2, neighbors)
     return edge_features
 
-def gather_nodes(nodes, neighbor_idx):
+def gather_nodes(nodes: torch.Tensor, neighbor_idx: torch.Tensor) -> torch.Tensor:
     # Features [B,N,C] at Neighbor indices [B,N,K] => [B,N,K,C]
     # Flatten and expand indices per batch [B,N,K] => [B,NK] => [B,NK,C]
     neighbors_flat = neighbor_idx.view((neighbor_idx.shape[0], -1))
@@ -24,26 +24,26 @@ def gather_nodes(nodes, neighbor_idx):
     neighbor_features = neighbor_features.view(list(neighbor_idx.shape)[:3] + [-1])
     return neighbor_features
 
-def gather_nodes_t(nodes, neighbor_idx):
+def gather_nodes_t(nodes: torch.Tensor, neighbor_idx: torch.Tensor) -> torch.Tensor:
     # Features [B,N,C] at Neighbor index [B,K] => Neighbor features[B,K,C]
     idx_flat = neighbor_idx.unsqueeze(-1).expand(-1, -1, nodes.size(2))
     neighbor_features = torch.gather(nodes, 1, idx_flat)
     return neighbor_features
 
-def cat_neighbors_nodes(h_nodes, h_neighbors, E_idx):
+def cat_neighbors_nodes(h_nodes: torch.Tensor, h_neighbors: torch.Tensor, E_idx: torch.Tensor) -> torch.Tensor:
     h_nodes = gather_nodes(h_nodes, E_idx)
     h_nn = torch.cat([h_neighbors, h_nodes], -1)
     return h_nn
 
 
 class Normalize(nn.Module):
-    def __init__(self, features, epsilon=1e-6):
+    def __init__(self, features: int, epsilon: float = 1e-6) -> None:
         super(Normalize, self).__init__()
         self.gain = nn.Parameter(torch.ones(features))
         self.bias = nn.Parameter(torch.zeros(features))
         self.epsilon = epsilon
 
-    def forward(self, x, dim=-1):
+    def forward(self, x: torch.Tensor, dim: int = -1) -> torch.Tensor:
         mu = x.mean(dim, keepdim=True)
         sigma = torch.sqrt(x.var(dim, keepdim=True) + self.epsilon)
         gain = self.gain
@@ -58,7 +58,7 @@ class Normalize(nn.Module):
 
 
 class TransformerLayer(nn.Module):
-    def __init__(self, num_hidden, num_in, num_heads=4, dropout=0.1):
+    def __init__(self, num_hidden: int, num_in: int, num_heads: int = 4, dropout: float = 0.1) -> None:
         super(TransformerLayer, self).__init__()
         self.num_heads = num_heads
         self.num_hidden = num_hidden
@@ -69,7 +69,7 @@ class TransformerLayer(nn.Module):
         self.attention = NeighborAttention(num_hidden, num_in, num_heads)
         self.dense = PositionWiseFeedForward(num_hidden, num_hidden * 4)
 
-    def forward(self, h_V, h_E, mask_V=None, mask_attend=None):
+    def forward(self, h_V: torch.Tensor, h_E: torch.Tensor, mask_V: torch.Tensor | None = None, mask_attend: torch.Tensor | None = None) -> torch.Tensor:
         """ Parallel computation of full transformer layer """
         # Self-attention
         dh = self.attention(h_V, h_E, mask_attend)
@@ -84,7 +84,7 @@ class TransformerLayer(nn.Module):
             h_V = mask_V * h_V
         return h_V
 
-    def step(self, t, h_V, h_E, mask_V=None, mask_attend=None):
+    def step(self, t: int, h_V: torch.Tensor, h_E: torch.Tensor, mask_V: torch.Tensor | None = None, mask_attend: torch.Tensor | None = None) -> torch.Tensor:
         """ Sequential computation of step t of a transformer layer """
         # Self-attention
         h_V_t = h_V[:,t,:]
@@ -102,7 +102,7 @@ class TransformerLayer(nn.Module):
 
 
 class MPNNLayer(nn.Module):
-    def __init__(self, num_hidden, num_in, dropout=0.1, num_heads=None, scale=30):
+    def __init__(self, num_hidden: int, num_in: int, dropout: float = 0.1, num_heads: int | None = None, scale: int = 30) -> None:
         super(MPNNLayer, self).__init__()
         self.num_hidden = num_hidden
         self.num_in = num_in
@@ -116,7 +116,7 @@ class MPNNLayer(nn.Module):
 
         self.dense = PositionWiseFeedForward(num_hidden, num_hidden * 4)
 
-    def forward(self, h_V, h_E, mask_V=None, mask_attend=None):
+    def forward(self, h_V: torch.Tensor, h_E: torch.Tensor, mask_V: torch.Tensor | None = None, mask_attend: torch.Tensor | None = None) -> torch.Tensor:
         """ Parallel computation of full transformer layer """
 
         # Concatenate h_V_i to h_E_ij
@@ -141,19 +141,19 @@ class MPNNLayer(nn.Module):
 
 
 class PositionWiseFeedForward(nn.Module):
-    def __init__(self, num_hidden, num_ff):
+    def __init__(self, num_hidden: int, num_ff: int) -> None:
         super(PositionWiseFeedForward, self).__init__()
         self.W_in = nn.Linear(num_hidden, num_ff, bias=True)
         self.W_out = nn.Linear(num_ff, num_hidden, bias=True)
 
-    def forward(self, h_V):
+    def forward(self, h_V: torch.Tensor) -> torch.Tensor:
         h = F.relu(self.W_in(h_V))
         h = self.W_out(h)
         return h
 
 
 class NeighborAttention(nn.Module):
-    def __init__(self, num_hidden, num_in, num_heads=4):
+    def __init__(self, num_hidden: int, num_in: int, num_heads: int = 4) -> None:
         super(NeighborAttention, self).__init__()
         self.num_heads = num_heads
         self.num_hidden = num_hidden
@@ -165,7 +165,7 @@ class NeighborAttention(nn.Module):
         self.W_O = nn.Linear(num_hidden, num_hidden, bias=False)
         return
 
-    def _masked_softmax(self, attend_logits, mask_attend, dim=-1):
+    def _masked_softmax(self, attend_logits: torch.Tensor, mask_attend: torch.Tensor, dim: int = -1) -> torch.Tensor:
         """ Numerically stable masked softmax """
         negative_inf = np.finfo(np.float32).min
         attend_logits = torch.where(mask_attend > 0, attend_logits, torch.tensor(negative_inf))
@@ -173,7 +173,7 @@ class NeighborAttention(nn.Module):
         attend = mask_attend * attend
         return attend
 
-    def forward(self, h_V, h_E, mask_attend=None):
+    def forward(self, h_V: torch.Tensor, h_E: torch.Tensor, mask_attend: torch.Tensor | None = None) -> torch.Tensor:
         """ Self-attention, graph-structured O(Nk)
         Args:
             h_V:            Node features           [N_batch, N_nodes, N_hidden]
@@ -209,7 +209,7 @@ class NeighborAttention(nn.Module):
         h_V_update = self.W_O(h_V_update)
         return h_V_update
 
-    def step(self, t, h_V, h_E, E_idx, mask_attend=None):
+    def step(self, t: int, h_V: torch.Tensor, h_E: torch.Tensor, E_idx: torch.Tensor, mask_attend: torch.Tensor | None = None) -> torch.Tensor:
         """ Self-attention for a specific time step t
 
         Args:
