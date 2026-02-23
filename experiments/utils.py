@@ -12,7 +12,7 @@ from torch.utils.data.dataset import random_split, Subset
 
 # Library code
 sys.path.insert(0, '..')
-from struct2seq import struct2seq, seq_model
+from struct2seq import struct2seq, seq_model, struct2seq_lo
 
 from argparse import ArgumentParser
 
@@ -79,6 +79,17 @@ def setup_model(hyperparams, device):
         model = seq_model.LanguageRNN(
             num_letters=hyperparams['vocab_size'],
             hidden_dim=hyperparams['hidden']
+        ).to(device)
+    elif hyperparams['model_type'] == 'structure_lo':
+        model = struct2seq_lo.Struct2SeqLO(
+            num_letters=hyperparams['vocab_size'],
+            node_features=hyperparams['hidden'],
+            edge_features=hyperparams['hidden'],
+            hidden_dim=hyperparams['hidden'],
+            k_neighbors=hyperparams['k_neighbors'],
+            protein_features=hyperparams['features'],
+            dropout=hyperparams['dropout'],
+            use_mpnn=hyperparams['mpnn']
         ).to(device)
 
     print('Number of parameters: {}'.format(sum([p.numel() for p in model.parameters()])))
