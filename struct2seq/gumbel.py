@@ -67,6 +67,10 @@ def plackett_luce_log_prob(
     flipped = torch.flip(ordered_logits_masked, [1])
     log_cumsum = torch.flip(torch.logcumsumexp(flipped, dim=1), [1])
 
-    log_probs = (log_numerator - log_cumsum) * valid_mask
+    log_probs = torch.where(
+        valid_mask.bool(),
+        log_numerator - log_cumsum,
+        torch.zeros_like(log_numerator),
+    )
 
     return log_probs

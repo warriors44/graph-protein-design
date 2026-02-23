@@ -340,6 +340,120 @@ class Struct2SeqLO(nn.Module):
         return elbo_avg, info
 
     # ------------------------------------------------------------------
+    # ELBO with REINFORCE Leave-One-Out gradient estimator
+    # ------------------------------------------------------------------
+
+    def compute_elbo_rloo(
+        self,
+        X: torch.Tensor,
+        S: torch.Tensor,
+        L: np.ndarray,
+        mask: torch.Tensor,
+        num_samples: int = 4,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Compute ELBO loss with REINFORCE leave-one-out (RLOO) gradient
+        estimator for the discrete ordering variable z.
+
+        Draws K permutation samples from q_theta and uses the leave-one-out
+        baseline to reduce variance of the REINFORCE gradient for q_theta.
+
+        The returned loss, when backpropagated, produces:
+          - Correct reparameterization gradients for p_theta parameters
+            (through F_theta terms).
+          - REINFORCE gradients for q_theta parameters (through
+            weight_k * log q(z^k) terms with stop-gradient on weights).
+
+        Args:
+            X: coordinates [B, N, 4, 3].
+            S: ground-truth sequence [B, N].
+            L: lengths array.
+            mask: padding mask [B, N].
+            num_samples: number of permutation samples K for RLOO.
+
+        Returns:
+            loss: scalar loss to backpropagate (minimise this).
+            info: dict with monitoring values.
+        """
+        K = num_samples
+        B, N = S.shape
+
+        h_V_enc, h_E, E_idx, _ = self._encode(X, L, mask)
+
+        q_logits = self.forward_q(h_V_enc, h_E, E_idx, S, mask)
+
+        f_values: list[torch.Tensor] = []
+        log_q_values: list[torch.Tensor] = []
+        nll_values: list[torch.Tensor] = []
+
+        for _ in range(K):
+            perm_k = gumbel_top_k(q_logits.detach())
+
+            log_probs_k, p_order_logits_k = self.forward_p(
+                h_V_enc, h_E, E_idx, S, mask, perm_k,
+            )
+
+            log_p_token_k = torch.gather(
+                log_probs_k, 2, S.unsqueeze(-1),
+            ).squeeze(-1)
+
+            log_q_order_k = plackett_luce_log_prob(q_logits, perm_k, mask)
+            log_p_order_k = plackett_luce_log_prob(p_order_logits_k, perm_k, mask)
+
+            log_p_token_perm_k = torch.gather(log_p_token_k, 1, perm_k)
+            mask_perm_k = torch.gather(mask, 1, perm_k)
+
+            f_per_step_k = (
+                log_p_token_perm_k
+                + log_p_order_k
+                - log_q_order_k
+            ) * mask_perm_k
+
+            f_k = f_per_step_k.sum(-1)
+            f_values.append(f_k)
+
+            log_q_sum_k = (log_q_order_k * mask_perm_k).sum(-1)
+            log_q_values.append(log_q_sum_k)
+
+            nll_k = -(log_p_token_k * mask).sum(-1) / mask.sum(-1)
+            nll_values.append(nll_k)
+
+        f_stack = torch.stack(f_values, dim=0)
+        log_q_stack = torch.stack(log_q_values, dim=0)
+
+        # --- (A) p_theta gradient: maximise mean F_theta ---
+        loss_p = -f_stack.mean(0).sum() / mask.sum()
+
+        # --- (B) REINFORCE gradient for q_theta ---
+        f_detached = f_stack.detach()
+        f_sum = f_detached.sum(0, keepdim=True)
+        if K > 1:
+            baselines = (f_sum - f_detached) / (K - 1)
+        else:
+            baselines = torch.zeros_like(f_detached)
+        weights = f_detached - baselines
+
+        loss_reinforce = -(weights * log_q_stack).mean(0).sum() / mask.sum()
+
+        loss = loss_p + loss_reinforce
+
+        # --- Monitoring ---
+        with torch.no_grad():
+            elbo_avg = f_stack.mean(0).sum() / mask.sum()
+            nll_stack = torch.stack(nll_values, dim=0)
+            nll_avg = nll_stack.mean()
+            reinforce_variance = weights.var()
+
+        info = {
+            'elbo': elbo_avg,
+            'nll': nll_avg,
+            'reinforce_var': reinforce_variance,
+            'loss_p': loss_p.detach(),
+            'loss_reinforce': loss_reinforce.detach(),
+        }
+
+        return loss, info
+
+    # ------------------------------------------------------------------
     # Forward (convenience wrapper matching original Struct2Seq interface)
     # ------------------------------------------------------------------
 

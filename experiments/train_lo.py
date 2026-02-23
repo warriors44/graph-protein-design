@@ -37,6 +37,8 @@ def get_args_lo() -> ArgumentParser:
     parser.add_argument('--augment', action='store_true')
     parser.add_argument('--shuffle', type=float, default=0.)
     parser.add_argument('--dropout', type=float, default=0.1)
+    parser.add_argument('--num_samples', type=int, default=4,
+                        help='Number of permutation samples K for RLOO')
     return parser.parse_args()
 
 
@@ -117,9 +119,10 @@ def main() -> None:
             )
 
             optimizer.zero_grad()
-            elbo_avg, info = model.compute_elbo(X, S, lengths, mask)
+            loss, info = model.compute_elbo_rloo(
+                X, S, lengths, mask, num_samples=args.num_samples,
+            )
 
-            loss = -elbo_avg
             loss.backward()
             optimizer.step()
 
@@ -132,11 +135,12 @@ def main() -> None:
             if total_step % 100 == 0:
                 elapsed = time.time() - start_train
                 print(
-                    'Step {} | {:.0f}s | ELBO {:.4f} | NLL {:.4f} | PPL {:.2f}'
-                    .format(
+                    'Step {} | {:.0f}s | ELBO {:.4f} | NLL {:.4f}'
+                    ' | PPL {:.2f} | RF_var {:.4f}'.format(
                         total_step, elapsed,
                         info['elbo'].item(), info['nll'].item(),
                         np.exp(info['nll'].item()),
+                        info.get('reinforce_var', torch.tensor(0.0)).item(),
                     )
                 )
 
