@@ -162,6 +162,50 @@ class Struct2SeqLO(nn.Module):
         mask = (rank_neighbors < rank_self).float()
         return mask
 
+    def _build_partial_ar_mask(
+        self,
+        E_idx: torch.Tensor,
+        full_perm: torch.Tensor,
+        i_samples: torch.Tensor,
+    ) -> torch.Tensor:
+        """Build autoregressive mask for partial decode (z_{<i}).
+
+        Decoded positions j=z_k see only z_{<k}. Remaining positions see
+        z_{<i} and not each other. This matches the probabilistic model
+        and sampling behavior.
+
+        Args:
+            E_idx: neighbor indices [B, N, K].
+            full_perm: full permutation [B, N] where full_perm[b, k] = position
+                decoded at step k.
+            i_samples: [B] number of decoded steps so far (1-indexed).
+
+        Returns:
+            mask: [B, N, K] with 1 where neighbor is in the visible past.
+        """
+        B, N = full_perm.shape
+        device = full_perm.device
+
+        rank = torch.zeros(B, N, dtype=torch.long, device=device)
+        rank.scatter_(
+            1, full_perm,
+            torch.arange(N, device=device).unsqueeze(0).expand(B, -1),
+        )
+
+        i_minus_1 = (i_samples - 1).clamp(min=0).unsqueeze(1)
+        rank_corrected = torch.where(
+            rank < i_minus_1,
+            rank,
+            i_minus_1.expand(-1, N),
+        )
+
+        rank_self = rank_corrected.unsqueeze(-1)
+        rank_flat = rank_corrected.unsqueeze(1).expand(-1, N, -1)
+        rank_neighbors = torch.gather(rank_flat, 2, E_idx)
+
+        mask = (rank_neighbors < rank_self).float()
+        return mask
+
     # ------------------------------------------------------------------
     # q_theta path: unmasked decoder for variational posterior
     # ------------------------------------------------------------------
@@ -214,10 +258,10 @@ class Struct2SeqLO(nn.Module):
         E_idx: torch.Tensor,
         S: torch.Tensor,
         mask: torch.Tensor,
-        permutation: torch.Tensor,
+        permutation: torch.Tensor | None = None,
+        ar_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run decoder with a generalized autoregressive mask defined by
-        the given permutation.
+        """Run decoder with a generalized autoregressive mask.
 
         Args:
             h_V_enc: encoder output [B, N, H].
@@ -225,21 +269,28 @@ class Struct2SeqLO(nn.Module):
             E_idx: neighbor indices [B, N, K].
             S: ground-truth sequence [B, N] (teacher forcing).
             mask: padding mask [B, N].
-            permutation: decoding order [B, N].
+            permutation: decoding order [B, N]. Required if ar_mask is None.
+            ar_mask: optional precomputed mask [B, N, K]. Used for partial
+                decode (e.g. with _build_partial_ar_mask).
 
         Returns:
             log_probs: [B, N, vocab] log-probabilities for each position.
             p_order_logits: [B, N] per-position order logits for p_theta.
         """
+        if ar_mask is not None:
+            mask_attend = ar_mask.unsqueeze(-1)
+        elif permutation is not None:
+            ar_mask = self._generalized_autoregressive_mask(E_idx, permutation)
+            mask_attend = ar_mask.unsqueeze(-1)
+        else:
+            raise ValueError("Either permutation or ar_mask must be provided")
+
         h_V = h_V_enc.clone()
         h_S = self.W_s(S)
         h_ES = cat_neighbors_nodes(h_S, h_E, E_idx)
 
         h_ES_encoder = cat_neighbors_nodes(torch.zeros_like(h_S), h_E, E_idx)
         h_ESV_encoder = cat_neighbors_nodes(h_V, h_ES_encoder, E_idx)
-
-        ar_mask = self._generalized_autoregressive_mask(E_idx, permutation)
-        mask_attend = ar_mask.unsqueeze(-1)
         mask_1D = mask.view([mask.size(0), mask.size(1), 1, 1])
         mask_bw = mask_1D * mask_attend
 
@@ -261,6 +312,61 @@ class Struct2SeqLO(nn.Module):
         p_order_logits = p_order_logits.masked_fill(mask == 0, float('-inf'))
 
         return log_probs, p_order_logits
+
+    # ------------------------------------------------------------------
+    # F_theta with exact expectation over z_i (Eq. 8)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _compute_F_theta(
+        log_probs: torch.Tensor,
+        p_order_logits: torch.Tensor,
+        q_logits: torch.Tensor,
+        S: torch.Tensor,
+        remaining_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute F_theta(z_{<i}, x) with exact expectation over z_i.
+
+        F = sum_{j in remaining} q(z_i=j | z_{<i}, x)
+              * [ log p(x_j | x_{z_{<i}}, s)
+                + log p(z_i=j | z_{<i}, x_{z_{<i}}, s)
+                - log q(z_i=j | z_{<i}, x, s) ]
+
+        Args:
+            log_probs: [B, N, vocab] from forward_p (with partial ar_mask).
+            p_order_logits: [B, N] from forward_p.
+            q_logits: [B, N] from forward_q (not detached).
+            S: ground-truth sequence [B, N].
+            remaining_mask: [B, N] binary, 1 for undecoded valid positions.
+
+        Returns:
+            F: [B] scalar F_theta per batch element.
+        """
+        log_p_token = torch.gather(
+            log_probs, 2, S.unsqueeze(-1),
+        ).squeeze(-1)
+
+        neg_inf = float('-inf')
+        log_p_order = F.log_softmax(
+            p_order_logits.masked_fill(remaining_mask == 0, neg_inf), dim=-1,
+        )
+        log_q_order = F.log_softmax(
+            q_logits.masked_fill(remaining_mask == 0, neg_inf), dim=-1,
+        )
+
+        q_weights = torch.where(
+            remaining_mask.bool(),
+            torch.exp(log_q_order),
+            torch.zeros_like(log_q_order),
+        )
+
+        inner = torch.where(
+            remaining_mask.bool(),
+            log_p_token + log_p_order - log_q_order,
+            torch.zeros_like(log_p_token),
+        )
+        F_val = (q_weights * inner).sum(-1)
+        return F_val
 
     # ------------------------------------------------------------------
     # ELBO computation
@@ -451,6 +557,111 @@ class Struct2SeqLO(nn.Module):
             'loss_reinforce': loss_reinforce.detach(),
         }
 
+        return loss, info
+
+    # ------------------------------------------------------------------
+    # Paper-faithful ELBO (Algorithm 1, Eqs. 8/9/11)
+    # ------------------------------------------------------------------
+
+    def compute_elbo_paper(
+        self,
+        X: torch.Tensor,
+        S: torch.Tensor,
+        L: np.ndarray,
+        mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """ELBO loss following Algorithm 1 of Wang et al. (arXiv:2503.05979).
+
+        1. Sample i ~ Uniform(1, ..., L_b) per batch element.
+        2. Draw K=2 independent partial permutations z^k_{<i} of length i-1
+           from the Plackett-Luce q_theta via Gumbel Top-K.
+        3. Compute F_theta(z^k_{<i}, x) with the *exact* expectation over z_i
+           (Eq. 8: sum over all remaining positions).
+        4. Construct the loss whose gradient equals the REINFORCE
+           leave-one-out estimator of Eq. 11.
+
+        Args:
+            X: coordinates [B, N, 4, 3].
+            S: ground-truth sequence [B, N].
+            L: lengths array (np).
+            mask: padding mask [B, N].
+
+        Returns:
+            loss: scalar loss to minimise.
+            info: monitoring dict.
+        """
+        B, N = S.shape
+        device = S.device
+
+        h_V_enc, h_E, E_idx, _ = self._encode(X, L, mask)
+        q_logits = self.forward_q(h_V_enc, h_E, E_idx, S, mask)
+
+        L_tensor = torch.tensor(L, dtype=torch.float, device=device)
+
+        i_samples = (
+            torch.rand(B, device=device) * L_tensor
+        ).long() + 1
+
+        F_values: list[torch.Tensor] = []
+        log_q_values: list[torch.Tensor] = []
+
+        for _ in range(2):
+            full_perm = gumbel_top_k(q_logits.detach())
+
+            ar_mask = self._build_partial_ar_mask(E_idx, full_perm, i_samples)
+            log_probs_k, p_order_logits_k = self.forward_p(
+                h_V_enc, h_E, E_idx, S, mask, ar_mask=ar_mask,
+            )
+
+            rank = torch.zeros(B, N, dtype=torch.long, device=device)
+            rank.scatter_(
+                1, full_perm,
+                torch.arange(N, device=device).unsqueeze(0).expand(B, -1),
+            )
+            decoded_mask = (
+                rank < (i_samples - 1).unsqueeze(1)
+            ).float()
+            remaining_mask = (1.0 - decoded_mask) * mask
+
+            F_k = self._compute_F_theta(
+                log_probs_k, p_order_logits_k, q_logits, S, remaining_mask,
+            )
+            F_values.append(F_k)
+
+            log_q_all = plackett_luce_log_prob(q_logits, full_perm, mask)
+            step_mask = (
+                torch.arange(N, device=device).unsqueeze(0)
+                < (i_samples - 1).unsqueeze(1)
+            ).float()
+            log_q_partial = (log_q_all * step_mask).sum(-1)
+            log_q_values.append(log_q_partial)
+
+        F1, F2 = F_values
+        log_q1, log_q2 = log_q_values
+
+        delta_F = (F1 - F2).detach()
+
+        loss_per_elem = -(L_tensor / 2.0) * (
+            F1 + F2 + delta_F * (log_q1 - log_q2)
+        )
+        loss = loss_per_elem.sum() / L_tensor.sum()
+
+        with torch.no_grad():
+            elbo_per_res = ((F1 + F2) / 2.0).mean()
+            log_p_token_1 = torch.gather(
+                F.log_softmax(self.W_out(h_V_enc), dim=-1),
+                2, S.unsqueeze(-1),
+            ).squeeze(-1)
+            nll_avg = -(log_p_token_1 * mask).sum() / mask.sum()
+
+        info = {
+            'elbo': elbo_per_res,
+            'nll': nll_avg,
+            'F1': F1.mean(),
+            'F2': F2.mean(),
+            'delta_F_abs': delta_F.abs().mean(),
+            'i_mean': i_samples.float().mean(),
+        }
         return loss, info
 
     # ------------------------------------------------------------------

@@ -119,9 +119,7 @@ def main() -> None:
             )
 
             optimizer.zero_grad()
-            loss, info = model.compute_elbo_rloo(
-                X, S, lengths, mask, num_samples=args.num_samples,
-            )
+            loss, info = model.compute_elbo_paper(X, S, lengths, mask)
 
             loss.backward()
             optimizer.step()
@@ -136,11 +134,11 @@ def main() -> None:
                 elapsed = time.time() - start_train
                 print(
                     'Step {} | {:.0f}s | ELBO {:.4f} | NLL {:.4f}'
-                    ' | PPL {:.2f} | RF_var {:.4f}'.format(
+                    ' | PPL {:.2f} | dF {:.4f}'.format(
                         total_step, elapsed,
                         info['elbo'].item(), info['nll'].item(),
                         np.exp(info['nll'].item()),
-                        info.get('reinforce_var', torch.tensor(0.0)).item(),
+                        info.get('delta_F_abs', torch.tensor(0.0)).item(),
                     )
                 )
 

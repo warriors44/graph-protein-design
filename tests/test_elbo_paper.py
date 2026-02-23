@@ -1,0 +1,151 @@
+"""Smoke test for compute_elbo_paper (Algorithm 1, Eqs. 8/9/11)."""
+from __future__ import annotations
+
+import sys
+import numpy as np
+import torch
+
+sys.path.insert(0, '..')
+from struct2seq.struct2seq_lo import Struct2SeqLO
+
+
+def _make_model_and_data(
+    B: int = 2, N: int = 20,
+) -> tuple[Struct2SeqLO, torch.Tensor, torch.Tensor, np.ndarray, torch.Tensor]:
+    device = torch.device('cpu')
+    model = Struct2SeqLO(
+        num_letters=20,
+        node_features=64,
+        edge_features=64,
+        hidden_dim=64,
+        num_encoder_layers=1,
+        num_decoder_layers=1,
+        vocab=20,
+        k_neighbors=10,
+        dropout=0.0,
+    ).to(device)
+    X = torch.randn(B, N, 4, 3, device=device)
+    S = torch.randint(0, 20, (B, N), device=device)
+    lengths = np.array([N, N - 3])
+    mask = torch.zeros(B, N, device=device)
+    for i, l in enumerate(lengths):
+        mask[i, :l] = 1.0
+    return model, X, S, lengths, mask
+
+
+def test_basic() -> None:
+    """Loss is finite, requires grad, and both order heads receive gradients."""
+    torch.manual_seed(42)
+    model, X, S, lengths, mask = _make_model_and_data()
+
+    loss, info = model.compute_elbo_paper(X, S, lengths, mask)
+
+    assert loss.requires_grad, "loss must require grad"
+    assert loss.shape == (), "loss must be scalar"
+    assert torch.isfinite(loss), f"loss must be finite, got {loss.item()}"
+    assert 'elbo' in info and 'nll' in info
+
+    loss.backward()
+
+    for tag in ('W_order_q', 'W_order_p'):
+        total = sum(
+            p.grad.abs().sum().item()
+            for n, p in model.named_parameters()
+            if tag in n and p.grad is not None
+        )
+        assert total > 0, f"{tag} must receive non-zero gradients"
+
+    print("test_basic PASSED")
+    print(f"  loss  = {loss.item():.4f}")
+    print(f"  ELBO  = {info['elbo'].item():.4f}")
+    print(f"  NLL   = {info['nll'].item():.4f}")
+    print(f"  |dF|  = {info['delta_F_abs'].item():.6f}")
+    print(f"  i_mean= {info['i_mean'].item():.1f}")
+
+    q_norm = sum(
+        p.grad.norm().item()
+        for n, p in model.named_parameters()
+        if 'W_order_q' in n and p.grad is not None
+    )
+    p_norm = sum(
+        p.grad.norm().item()
+        for n, p in model.named_parameters()
+        if 'W_order_p' in n and p.grad is not None
+    )
+    print(f"  q_grad_norm = {q_norm:.6f}")
+    print(f"  p_grad_norm = {p_norm:.6f}")
+
+
+def test_edge_i_equals_1() -> None:
+    """When i=1 for all batch elements, no positions are decoded yet."""
+    torch.manual_seed(0)
+    model, X, S, lengths, mask = _make_model_and_data()
+
+    B, N = S.shape
+    device = S.device
+
+    h_V_enc, h_E, E_idx, _ = model._encode(X, lengths, mask)
+    q_logits = model.forward_q(h_V_enc, h_E, E_idx, S, mask)
+
+    from struct2seq.gumbel import gumbel_top_k
+    full_perm = gumbel_top_k(q_logits.detach())
+    i_samples = torch.ones(B, dtype=torch.long, device=device)
+
+    ar_mask = model._build_partial_ar_mask(E_idx, full_perm, i_samples)
+    log_probs, p_order_logits = model.forward_p(
+        h_V_enc, h_E, E_idx, S, mask, ar_mask=ar_mask,
+    )
+    remaining_mask = mask.clone()
+    F_val = Struct2SeqLO._compute_F_theta(
+        log_probs, p_order_logits, q_logits, S, remaining_mask,
+    )
+    assert torch.isfinite(F_val).all(), f"F must be finite, got {F_val}"
+    print(f"test_edge_i_equals_1 PASSED  F={F_val.tolist()}")
+
+
+def test_edge_i_equals_L() -> None:
+    """When i=L, only one position remains undecoded."""
+    torch.manual_seed(1)
+    model, X, S, lengths, mask = _make_model_and_data()
+
+    B, N = S.shape
+    device = S.device
+
+    h_V_enc, h_E, E_idx, _ = model._encode(X, lengths, mask)
+    q_logits = model.forward_q(h_V_enc, h_E, E_idx, S, mask)
+
+    from struct2seq.gumbel import gumbel_top_k
+    full_perm = gumbel_top_k(q_logits.detach())
+
+    L_tensor = torch.tensor(lengths, device=device)
+    i_samples = L_tensor.long()
+
+    rank = torch.zeros(B, N, dtype=torch.long, device=device)
+    rank.scatter_(
+        1, full_perm,
+        torch.arange(N, device=device).unsqueeze(0).expand(B, -1),
+    )
+    decoded_mask = (rank < (i_samples - 1).unsqueeze(1)).float()
+
+    remaining_mask = (1.0 - decoded_mask) * mask
+    remaining_count = remaining_mask.sum(-1)
+    assert (remaining_count == 1).all(), (
+        f"Exactly 1 position should remain, got {remaining_count.tolist()}"
+    )
+
+    ar_mask = model._build_partial_ar_mask(E_idx, full_perm, i_samples)
+    log_probs, p_order_logits = model.forward_p(
+        h_V_enc, h_E, E_idx, S, mask, ar_mask=ar_mask,
+    )
+    F_val = Struct2SeqLO._compute_F_theta(
+        log_probs, p_order_logits, q_logits, S, remaining_mask,
+    )
+    assert torch.isfinite(F_val).all(), f"F must be finite, got {F_val}"
+    print(f"test_edge_i_equals_L PASSED  F={F_val.tolist()}")
+
+
+if __name__ == '__main__':
+    test_basic()
+    test_edge_i_equals_1()
+    test_edge_i_equals_L()
+    print("\nALL TESTS PASSED")
