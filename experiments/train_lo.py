@@ -14,36 +14,13 @@ from torch.utils.data.dataset import Subset
 sys.path.insert(0, '..')
 from struct2seq import data, noam_opt, struct2seq_lo
 
-from argparse import ArgumentParser
-from utils import featurize, loss_nll, load_checkpoint, setup_device_rng
+from utils import featurize, loss_nll, load_checkpoint, setup_device_rng, get_args
 
 
-def get_args_lo() -> ArgumentParser:
-    parser = ArgumentParser(description='Learning-Order Struct2Seq training')
-    parser.add_argument('--hidden', type=int, default=128)
-    parser.add_argument('--k_neighbors', type=int, default=30)
-    parser.add_argument('--vocab_size', type=int, default=20)
-    parser.add_argument('--features', type=str, default='full')
-    parser.add_argument('--mpnn', action='store_true')
-
-    parser.add_argument('--restore', type=str, default='')
-    parser.add_argument('--name', type=str, default='')
-    parser.add_argument('--file_data', type=str, default='../data/cath/chain_set.jsonl')
-    parser.add_argument('--file_splits', type=str, default='../data/cath/chain_set_splits.json')
-    parser.add_argument('--batch_tokens', type=int, default=2500)
-    parser.add_argument('--epochs', type=int, default=100)
-    parser.add_argument('--seed', type=int, default=1111)
-    parser.add_argument('--cuda', action='store_true')
-    parser.add_argument('--augment', action='store_true')
-    parser.add_argument('--shuffle', type=float, default=0.)
-    parser.add_argument('--dropout', type=float, default=0.1)
-    parser.add_argument('--num_samples', type=int, default=4,
-                        help='Number of permutation samples K for RLOO')
-    return parser.parse_args()
 
 
 def main() -> None:
-    args = get_args_lo()
+    args = get_args()
     device = setup_device_rng(args)
 
     # Build model
@@ -99,7 +76,7 @@ def main() -> None:
 
     logfile = base_folder + 'log.txt'
     with open(logfile, 'w') as f:
-        f.write('Epoch\tTrain_ELBO\tTrain_NLL\tVal_NLL\n')
+        f.write('Epoch\tTrain_PPL\tVal_PPL\tTrain_ELBO\tTrain_NLL\tVal_NLL\n')
     with open(base_folder + 'args.json', 'w') as f:
         json.dump(vars(args), f)
 
@@ -171,8 +148,8 @@ def main() -> None:
         ))
 
         with open(logfile, 'a') as f:
-            f.write('{}\t{:.4f}\t{:.4f}\t{:.4f}\n'.format(
-                e + 1, train_elbo, train_nll, val_nll,
+            f.write('{}\t{}\t{}\t{:.4f}\t{:.4f}\t{:.4f}\n'.format(
+                e + 1, train_ppl, val_ppl, train_elbo, train_nll, val_nll,
             ))
 
         ckpt = base_folder + 'checkpoints/epoch{}_step{}.pt'.format(e + 1, total_step)
@@ -190,6 +167,8 @@ def main() -> None:
     best_idx = int(np.argmin(epoch_losses_valid))
     best_ckpt = epoch_checkpoints[best_idx]
     best_copy = base_folder + 'best_checkpoint_epoch{}.pt'.format(best_idx + 1)
+    best_validation_ppl = epoch_losses_valid[best_idx]
+    best_train_ppl = np.exp(train_nll_sum / train_weights)
     shutil.copy(best_ckpt, best_copy)
     load_checkpoint(best_copy, model)
 
@@ -205,11 +184,11 @@ def main() -> None:
             test_weights += torch.sum(mask).cpu().item()
 
     test_ppl = np.exp(test_sum / test_weights)
-    print('Test Perplexity: {:.2f}'.format(test_ppl))
+    print('Perplexity\tTest:{}'.format(test_ppl))
 
     with open(base_folder + 'results.txt', 'w') as f:
-        f.write('Best epoch: {}\nTest perplexity: {:.4f}\n'.format(
-            best_idx + 1, test_ppl,
+        f.write('Best epoch: {}\nPerplexities:\n\tTrain: {}\n\tValidation: {}\n\tTest: {}'.format(
+            best_idx + 1, best_train_ppl, best_validation_ppl, test_ppl,
         ))
 
 
