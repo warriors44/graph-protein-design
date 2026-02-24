@@ -2,10 +2,14 @@
 from __future__ import annotations
 
 import sys
+import os
 import numpy as np
 import torch
 
-sys.path.insert(0, '..')
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
 from struct2seq.struct2seq_lo import Struct2SeqLO
 
 
