@@ -44,12 +44,17 @@ class Struct2SeqLO(nn.Module):
         dropout: float = 0.1,
         forward_attention_decoder: bool = True,
         use_mpnn: bool = False,
+        num_samples: int = 2,
     ) -> None:
         super(Struct2SeqLO, self).__init__()
+
+        if num_samples < 2:
+            raise ValueError("num_samples must be >= 2 for RLOO estimator.")
 
         self.node_features = node_features
         self.edge_features = edge_features
         self.hidden_dim = hidden_dim
+        self.num_samples = num_samples
 
         # Featurization
         self.features = ProteinFeatures(
@@ -382,8 +387,9 @@ class Struct2SeqLO(nn.Module):
         """ELBO loss following Algorithm 1 of Wang et al. (arXiv:2503.05979).
 
         1. Sample i ~ Uniform(1, ..., L_b) per batch element.
-        2. Draw K=2 independent partial permutations z^k_{<i} of length i-1
-           from the Plackett-Luce q_theta via Gumbel Top-K.
+        2. Draw K independent partial permutations z^k_{<i} of length i-1
+           from the Plackett-Luce q_theta via Gumbel Top-K, where
+           K = self.num_samples (RLOO samples).
         3. Compute F_theta(z^k_{<i}, x) with the *exact* expectation over z_i
            (Eq. 8: sum over all remaining positions).
         4. Construct the loss whose gradient equals the REINFORCE
@@ -414,7 +420,9 @@ class Struct2SeqLO(nn.Module):
         F_values: list[torch.Tensor] = []
         log_q_values: list[torch.Tensor] = []
 
-        for _ in range(2):
+        K = self.num_samples
+
+        for _ in range(K):
             full_perm = gumbel_top_k(q_logits.detach())
 
             ar_mask = self._build_partial_ar_mask(E_idx, full_perm, i_samples)
@@ -445,24 +453,45 @@ class Struct2SeqLO(nn.Module):
             log_q_partial = (log_q_all * step_mask).sum(-1)
             log_q_values.append(log_q_partial)
 
-        F1, F2 = F_values
-        log_q1, log_q2 = log_q_values
+        # Stack along new sample dimension: [K, B]
+        F_stack = torch.stack(F_values, dim=0)
+        log_q_stack = torch.stack(log_q_values, dim=0)
 
-        delta_F = (F1 - F2).detach()
+        if K < 2:
+            raise ValueError("RLOO estimator requires num_samples >= 2.")
 
-        loss_per_elem = -(L_tensor / 2.0) * (
-            F1 + F2 + delta_F * (log_q1 - log_q2)
-        )
+        # Mean F over samples (p_theta ELBO part)
+        F_mean = F_stack.mean(dim=0)  # [B]
+
+        # Leave-one-out baselines for each sample k
+        sum_F = F_stack.sum(dim=0)  # [B]
+        F_minus_k = (sum_F.unsqueeze(0) - F_stack) / float(K - 1)  # [K, B]
+
+        # Advantages for q_theta (no gradient through F_minus_k)
+        adv = (F_stack - F_minus_k).detach()  # [K, B]
+
+        # RLOO term: average over K samples
+        rloo_term = (adv * log_q_stack).mean(dim=0)  # [B]
+
+        loss_per_elem = -L_tensor * (F_mean + rloo_term)
         loss = loss_per_elem.sum() / L_tensor.sum()
 
         with torch.no_grad():
-            elbo_per_res = ((F1 + F2) / 2.0).mean()
+            elbo_per_res = F_mean.mean()
+            delta_F_abs = (F_stack - F_mean.unsqueeze(0)).abs().mean()
+
+            # Decoder-based NLL under fixed N->C ordering for monitoring
+            log_probs_all = self.forward(X, S, L, mask)
+            log_p_token_all = torch.gather(
+                log_probs_all, 2, S.unsqueeze(-1),
+            ).squeeze(-1)
+            nll_avg = -(log_p_token_all * mask).sum() / mask.sum()
 
         info = {
             'elbo': elbo_per_res,
-            'F1': F1.mean(),
-            'F2': F2.mean(),
-            'delta_F_abs': delta_F.abs().mean(),
+            'nll': nll_avg,
+            'F_mean': F_mean.mean(),
+            'delta_F_abs': delta_F_abs,
             'i_mean': i_samples.float().mean(),
         }
         return loss, info

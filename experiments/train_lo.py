@@ -33,6 +33,7 @@ def main() -> None:
         protein_features=args.features,
         dropout=args.dropout,
         use_mpnn=args.mpnn,
+        num_samples=args.num_samples,
     ).to(device)
     print('Number of parameters: {}'.format(
         sum(p.numel() for p in model.parameters())

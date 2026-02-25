@@ -39,6 +39,12 @@ def get_args():
     parser.add_argument('--shuffle', type=float, default=0., help='Shuffle for training a background model')
     parser.add_argument('--dropout', type=float, default=0.1, help='Dropout rate')
     parser.add_argument('--smoothing', type=float, default=0.1, help='Label smoothing rate')
+    parser.add_argument(
+        '--num_samples',
+        type=int,
+        default=2,
+        help='Number of RLOO samples (K) for LO-ARM ELBO',
+    )
     args = parser.parse_args()
     return args
 
@@ -89,7 +95,8 @@ def setup_model(hyperparams, device):
             k_neighbors=hyperparams['k_neighbors'],
             protein_features=hyperparams['features'],
             dropout=hyperparams['dropout'],
-            use_mpnn=hyperparams['mpnn']
+            use_mpnn=hyperparams['mpnn'],
+            num_samples=hyperparams.get('num_samples', 2),
         ).to(device)
 
     print('Number of parameters: {}'.format(sum([p.numel() for p in model.parameters()])))
