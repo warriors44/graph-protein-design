@@ -45,16 +45,23 @@ class Struct2SeqLO(nn.Module):
         forward_attention_decoder: bool = True,
         use_mpnn: bool = False,
         num_samples: int = 2,
+        q_arch: str = "shared",
     ) -> None:
         super(Struct2SeqLO, self).__init__()
 
         if num_samples < 2:
             raise ValueError("num_samples must be >= 2 for RLOO estimator.")
 
+        if q_arch not in ("shared", "separate"):
+            raise ValueError(
+                f"q_arch must be 'shared' or 'separate', got {q_arch!r}",
+            )
+
         self.node_features = node_features
         self.edge_features = edge_features
         self.hidden_dim = hidden_dim
         self.num_samples = num_samples
+        self.q_arch = q_arch
 
         # Featurization
         self.features = ProteinFeatures(
@@ -97,6 +104,18 @@ class Struct2SeqLO(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim, 1),
         )
+
+        # Optional separate torso for q_theta (variational order posterior)
+        if self.q_arch == "separate":
+            self.q_decoder_layers = nn.ModuleList([
+                layer(hidden_dim, hidden_dim * 3, dropout=dropout)
+                for _ in range(num_decoder_layers)
+            ])
+            self.W_order_q_sep = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, 1),
+            )
 
         # Initialization
         for p in self.parameters():
@@ -244,11 +263,23 @@ class Struct2SeqLO(nn.Module):
         mask_attend = gather_nodes(mask.unsqueeze(-1), E_idx).squeeze(-1)
         mask_attend = mask.unsqueeze(-1) * mask_attend
 
-        for dec_layer in self.decoder_layers:
+        if self.q_arch == "shared":
+            decoder_layers = self.decoder_layers
+            order_head = self.W_order_q
+        elif self.q_arch == "separate":
+            decoder_layers = self.q_decoder_layers
+            order_head = self.W_order_q_sep
+        else:
+            raise ValueError(
+                f"Unsupported q_arch value {self.q_arch!r}. "
+                "Expected 'shared' or 'separate'.",
+            )
+
+        for dec_layer in decoder_layers:
             h_ESV = cat_neighbors_nodes(h_V, h_ES, E_idx)
             h_V = dec_layer(h_V, h_ESV, mask_V=mask, mask_attend=mask_attend)
 
-        q_logits = self.W_order_q(h_V).squeeze(-1)
+        q_logits = order_head(h_V).squeeze(-1)
         q_logits = q_logits.masked_fill(mask == 0, float('-inf'))
         return q_logits
 

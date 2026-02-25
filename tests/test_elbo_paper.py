@@ -14,7 +14,9 @@ from struct2seq.struct2seq_lo import Struct2SeqLO
 
 
 def _make_model_and_data(
-    B: int = 2, N: int = 20,
+    B: int = 2,
+    N: int = 20,
+    q_arch: str = "shared",
 ) -> tuple[Struct2SeqLO, torch.Tensor, torch.Tensor, np.ndarray, torch.Tensor]:
     device = torch.device('cpu')
     model = Struct2SeqLO(
@@ -27,6 +29,7 @@ def _make_model_and_data(
         vocab=20,
         k_neighbors=10,
         dropout=0.0,
+        q_arch=q_arch,
     ).to(device)
     X = torch.randn(B, N, 4, 3, device=device)
     S = torch.randint(0, 20, (B, N), device=device)
@@ -38,46 +41,51 @@ def _make_model_and_data(
 
 
 def test_basic() -> None:
-    """Loss is finite, requires grad, and both order heads receive gradients."""
-    torch.manual_seed(42)
-    model, X, S, lengths, mask = _make_model_and_data()
+    """Loss is finite, requires grad, and both order heads receive gradients.
 
-    loss, info = model.compute_elbo_paper(X, S, lengths, mask)
+    This test is run for both q_arch='shared' and q_arch='separate' to ensure
+    that the ELBO implementation supports both parameterisations.
+    """
+    for q_arch in ("shared", "separate"):
+        torch.manual_seed(42)
+        model, X, S, lengths, mask = _make_model_and_data(q_arch=q_arch)
 
-    assert loss.requires_grad, "loss must require grad"
-    assert loss.shape == (), "loss must be scalar"
-    assert torch.isfinite(loss), f"loss must be finite, got {loss.item()}"
-    assert 'elbo' in info and 'nll' in info
+        loss, info = model.compute_elbo_paper(X, S, lengths, mask)
 
-    loss.backward()
+        assert loss.requires_grad, "loss must require grad"
+        assert loss.shape == (), "loss must be scalar"
+        assert torch.isfinite(loss), f"loss must be finite, got {loss.item()}"
+        assert 'elbo' in info and 'nll' in info
 
-    for tag in ('W_order_q', 'W_order_p'):
-        total = sum(
-            p.grad.abs().sum().item()
+        loss.backward()
+
+        for tag in ('W_order_q', 'W_order_p'):
+            total = sum(
+                p.grad.abs().sum().item()
+                for n, p in model.named_parameters()
+                if tag in n and p.grad is not None
+            )
+            assert total > 0, f"{tag} must receive non-zero gradients (q_arch={q_arch})"
+
+        print(f"test_basic PASSED (q_arch={q_arch})")
+        print(f"  loss  = {loss.item():.4f}")
+        print(f"  ELBO  = {info['elbo'].item():.4f}")
+        print(f"  NLL   = {info['nll'].item():.4f}")
+        print(f"  |dF|  = {info['delta_F_abs'].item():.6f}")
+        print(f"  i_mean= {info['i_mean'].item():.1f}")
+
+        q_norm = sum(
+            p.grad.norm().item()
             for n, p in model.named_parameters()
-            if tag in n and p.grad is not None
+            if 'W_order_q' in n and p.grad is not None
         )
-        assert total > 0, f"{tag} must receive non-zero gradients"
-
-    print("test_basic PASSED")
-    print(f"  loss  = {loss.item():.4f}")
-    print(f"  ELBO  = {info['elbo'].item():.4f}")
-    print(f"  NLL   = {info['nll'].item():.4f}")
-    print(f"  |dF|  = {info['delta_F_abs'].item():.6f}")
-    print(f"  i_mean= {info['i_mean'].item():.1f}")
-
-    q_norm = sum(
-        p.grad.norm().item()
-        for n, p in model.named_parameters()
-        if 'W_order_q' in n and p.grad is not None
-    )
-    p_norm = sum(
-        p.grad.norm().item()
-        for n, p in model.named_parameters()
-        if 'W_order_p' in n and p.grad is not None
-    )
-    print(f"  q_grad_norm = {q_norm:.6f}")
-    print(f"  p_grad_norm = {p_norm:.6f}")
+        p_norm = sum(
+            p.grad.norm().item()
+            for n, p in model.named_parameters()
+            if 'W_order_p' in n and p.grad is not None
+        )
+        print(f"  q_grad_norm = {q_norm:.6f}")
+        print(f"  p_grad_norm = {p_norm:.6f}")
 
 
 def test_edge_i_equals_1() -> None:

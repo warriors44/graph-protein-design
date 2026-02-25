@@ -45,6 +45,13 @@ def get_args():
         default=2,
         help='Number of RLOO samples (K) for LO-ARM ELBO',
     )
+    parser.add_argument(
+        '--q_arch',
+        type=str,
+        default='shared',
+        choices=['shared', 'separate'],
+        help='Architecture for q_theta: shared torso or separate network',
+    )
     args = parser.parse_args()
     return args
 
@@ -97,6 +104,7 @@ def setup_model(hyperparams, device):
             dropout=hyperparams['dropout'],
             use_mpnn=hyperparams['mpnn'],
             num_samples=hyperparams.get('num_samples', 2),
+            q_arch=hyperparams.get('q_arch', 'shared'),
         ).to(device)
 
     print('Number of parameters: {}'.format(sum([p.numel() for p in model.parameters()])))
