@@ -88,7 +88,7 @@ def main() -> None:
 
     for e in range(args.epochs):
         model.train()
-        train_elbo_sum, train_nll_sum, train_weights = 0., 0., 0.
+        train_elbo_sum, train_nll_sum, train_weights = 0.0, 0.0, 0.0
 
         for train_i, batch in enumerate(loader_train):
             X, S, mask, lengths = featurize(
@@ -101,21 +101,28 @@ def main() -> None:
             loss.backward()
             optimizer.step()
 
+            # Decoder-based NLL for logging (matches validation metric)
+            with torch.no_grad():
+                log_probs = model(X, S, lengths, mask)
+                _, loss_avg = loss_nll(S, log_probs, mask)
+
             total_step += 1
             n_tokens = mask.sum().item()
-            train_elbo_sum += info['elbo'].item() * n_tokens
-            train_nll_sum += info['nll'].item() * n_tokens
+            train_elbo_sum += info["elbo"].item() * n_tokens
+            train_nll_sum += loss_avg.item() * n_tokens
             train_weights += n_tokens
 
             if total_step % 100 == 0:
                 elapsed = time.time() - start_train
                 print(
-                    'Step {} | {:.0f}s | ELBO {:.4f} | NLL {:.4f}'
-                    ' | PPL {:.2f} | dF {:.4f}'.format(
-                        total_step, elapsed,
-                        info['elbo'].item(), info['nll'].item(),
-                        np.exp(info['nll'].item()),
-                        info.get('delta_F_abs', torch.tensor(0.0)).item(),
+                    "Step {} | {:.0f}s | ELBO {:.4f} | NLL {:.4f}"
+                    " | PPL {:.2f} | dF {:.4f}".format(
+                        total_step,
+                        elapsed,
+                        info["elbo"].item(),
+                        loss_avg.item(),
+                        float(np.exp(loss_avg.item())),
+                        info.get("delta_F_abs", torch.tensor(0.0)).item(),
                     )
                 )
 

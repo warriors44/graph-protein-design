@@ -457,15 +457,9 @@ class Struct2SeqLO(nn.Module):
 
         with torch.no_grad():
             elbo_per_res = ((F1 + F2) / 2.0).mean()
-            log_p_token_1 = torch.gather(
-                F.log_softmax(self.W_out(h_V_enc), dim=-1),
-                2, S.unsqueeze(-1),
-            ).squeeze(-1)
-            nll_avg = -(log_p_token_1 * mask).sum() / mask.sum()
 
         info = {
             'elbo': elbo_per_res,
-            'nll': nll_avg,
             'F1': F1.mean(),
             'F2': F2.mean(),
             'delta_F_abs': delta_F.abs().mean(),
