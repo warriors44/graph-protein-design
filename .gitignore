@@ -13,7 +13,7 @@
 *.pt
 *.e*
 *.o*
-
+sh
 
 __pycache__/
 
