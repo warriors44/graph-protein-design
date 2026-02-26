@@ -111,6 +111,29 @@ def test_loglik_is_q_basic() -> None:
     )
 
 
+def test_loglik_mc_p_basic() -> None:
+    """Basic sanity check for compute_loglik_mc_p.
+
+    Ensures that the p-theta Monte Carlo estimator returns finite
+    per-residue log-likelihoods for a small random problem.
+    """
+    torch.manual_seed(0)
+    model, X, S, lengths, mask = _make_model_and_data()
+
+    loglik_per_res = model.compute_loglik_mc_p(
+        X,
+        S,
+        lengths,
+        mask,
+        num_samples_eval=2,
+    )
+
+    assert loglik_per_res.shape == (S.size(0),)
+    assert torch.isfinite(loglik_per_res).all(), (
+        f"loglik_per_res must be finite, got {loglik_per_res}"
+    )
+
+
 def test_edge_i_equals_1() -> None:
     """When i=1 for all batch elements, no positions are decoded yet."""
     torch.manual_seed(0)

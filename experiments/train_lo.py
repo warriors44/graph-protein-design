@@ -158,6 +158,22 @@ def main() -> None:
                     nll_batch = -(loglik_per_res * L_tensor).sum().cpu().item()
                     val_sum += nll_batch
                     val_weights += L_tensor.sum().cpu().item()
+                elif args.eval_mode == 'mc_p':
+                    loglik_per_res = model.compute_loglik_mc_p(
+                        X,
+                        S,
+                        lengths,
+                        mask,
+                        num_samples_eval=args.eval_num_samples,
+                    )
+                    L_tensor = torch.tensor(
+                        lengths,
+                        dtype=torch.float32,
+                        device=loglik_per_res.device,
+                    )
+                    nll_batch = -(loglik_per_res * L_tensor).sum().cpu().item()
+                    val_sum += nll_batch
+                    val_weights += L_tensor.sum().cpu().item()
                 else:
                     log_probs = model(X, S, lengths, mask)
                     loss_per_res, loss_avg = loss_nll(S, log_probs, mask)
@@ -208,6 +224,22 @@ def main() -> None:
 
             if args.eval_mode == 'is_q':
                 loglik_per_res = model.compute_loglik_is_q(
+                    X,
+                    S,
+                    lengths,
+                    mask,
+                    num_samples_eval=args.eval_num_samples,
+                )
+                L_tensor = torch.tensor(
+                    lengths,
+                    dtype=torch.float32,
+                    device=loglik_per_res.device,
+                )
+                nll_batch = -(loglik_per_res * L_tensor).sum().cpu().item()
+                test_sum += nll_batch
+                test_weights += L_tensor.sum().cpu().item()
+            elif args.eval_mode == 'mc_p':
+                loglik_per_res = model.compute_loglik_mc_p(
                     X,
                     S,
                     lengths,

@@ -611,6 +611,296 @@ class Struct2SeqLO(nn.Module):
         return loglik_per_res
 
     # ------------------------------------------------------------------
+    # p_theta-only Monte Carlo estimate of log p_theta(x | s)
+    # ------------------------------------------------------------------
+
+    def compute_loglik_mc_p(
+        self,
+        X: torch.Tensor,
+        S: torch.Tensor,
+        L: np.ndarray,
+        mask: torch.Tensor,
+        num_samples_eval: int | None = None,
+    ) -> torch.Tensor:
+        """Estimate log p_theta(x | s) via Monte Carlo over orders from p_theta.
+
+        For each batch element b:
+          1. Sequentially sample a permutation z^(k) ~ p_theta(z | s) using the
+             p_theta order head with partial autoregressive masks:
+               - Start with no decoded positions.
+               - At each step i, build a partial AR mask corresponding to the
+                 current prefix z_{<i} via _build_partial_ar_mask.
+               - Run forward_p under teacher forcing to obtain order logits and
+                 sample the next position z_i among remaining positions.
+          2. After a full permutation is sampled, run forward_p once with the
+             full permutation to compute log p_theta(x | z^(k), s).
+          3. Average over K_eval such samples in log-space to approximate
+             log p_theta(x | s).
+
+        Args:
+            X: coordinates [B, N, 4, 3].
+            S: ground-truth sequence [B, N].
+            L: lengths array (np).
+            mask: padding mask [B, N].
+            num_samples_eval: number of Monte Carlo samples K_eval. If None,
+                a default value of 8 is used.
+
+        Returns:
+            loglik_per_res: [B] per-residue log-likelihood estimates
+                log p_theta(x | s) / L_b for each batch element.
+        """
+        B, N = S.shape
+        device = S.device
+
+        h_V_enc, h_E, E_idx, _ = self._encode(X, L, mask)
+
+        L_tensor = torch.tensor(L, dtype=torch.float32, device=device)
+
+        K_eval = num_samples_eval if num_samples_eval is not None else 8
+        if K_eval < 1:
+            raise ValueError("num_samples_eval must be >= 1.")
+
+        log_terms: list[torch.Tensor] = []
+
+        for _ in range(K_eval):
+            # Initialise decoded mask and permutation for this sample.
+            decoded_mask = torch.zeros(B, N, dtype=torch.float32, device=device)
+            full_perm = torch.arange(N, device=device).unsqueeze(0).expand(B, -1).clone()
+
+            while True:
+                any_active = False
+
+                for b in range(B):
+                    length_b = int(L[b])
+                    mask_b = mask[b]  # [N]
+
+                    # Remaining valid, undecoded positions for this batch element.
+                    remaining_mask_b = mask_b * (1.0 - decoded_mask[b])
+                    if remaining_mask_b.sum().item() == 0:
+                        continue
+
+                    any_active = True
+
+                    decoded_count_b = int((decoded_mask[b] * mask_b).sum().item())
+                    if decoded_count_b >= length_b:
+                        continue
+
+                    i_samples_b = torch.tensor(
+                        [min(decoded_count_b + 1, length_b)],
+                        dtype=torch.long,
+                        device=device,
+                    )
+
+                    # Build partial AR mask for this prefix using current permutation.
+                    ar_mask_b = self._build_partial_ar_mask(
+                        E_idx[b:b+1],
+                        full_perm[b:b+1],
+                        i_samples_b,
+                    )
+
+                    # Run forward_p for this single element to get order logits.
+                    log_probs_step_b, p_order_logits_step_b = self.forward_p(
+                        h_V_enc[b:b+1],
+                        h_E[b:b+1],
+                        E_idx[b:b+1],
+                        S[b:b+1],
+                        mask[b:b+1],
+                        ar_mask=ar_mask_b,
+                    )
+                    # Silence unused variable warning.
+                    _ = log_probs_step_b
+
+                    remaining_mask_b_2d = remaining_mask_b.unsqueeze(0)
+                    logits_step_b = p_order_logits_step_b.clone()
+                    logits_step_b = logits_step_b.masked_fill(
+                        remaining_mask_b_2d == 0,
+                        float('-inf'),
+                    )
+
+                    order_probs_b = F.softmax(logits_step_b, dim=-1)
+                    pos_b = torch.multinomial(order_probs_b, 1).squeeze(0).squeeze(-1)
+
+                    # Maintain consistency between permutation and decoded mask by
+                    # swapping the newly selected position into the next prefix slot.
+                    decoded_count_b_tensor = int(
+                        (decoded_mask[b] * mask_b).sum().item(),
+                    )
+                    perm_b = full_perm[b]
+                    idx_in_perm = (perm_b == pos_b).nonzero(as_tuple=False)[0, 0]
+
+                    full_perm[b, idx_in_perm] = perm_b[decoded_count_b_tensor]
+                    full_perm[b, decoded_count_b_tensor] = pos_b
+
+                    decoded_mask[b, pos_b] = 1.0
+
+                if not any_active:
+                    break
+
+            # Full permutation for this Monte Carlo sample; compute log p(x | z, s).
+            log_probs_k, _ = self.forward_p(
+                h_V_enc,
+                h_E,
+                E_idx,
+                S,
+                mask,
+                permutation=full_perm,
+            )
+
+            log_p_token = torch.gather(
+                log_probs_k,
+                2,
+                S.unsqueeze(-1),
+            ).squeeze(-1)
+            log_p_x_given_z = (log_p_token * mask).sum(-1)
+
+            log_terms.append(log_p_x_given_z)
+
+        log_terms_stack = torch.stack(log_terms, dim=0)
+        log_p_x_given_s = torch.logsumexp(log_terms_stack, dim=0) - float(np.log(K_eval))
+
+        loglik_per_res = log_p_x_given_s / L_tensor
+        return loglik_per_res
+
+    # ------------------------------------------------------------------
+    # p-theta-only Monte Carlo estimate of log p_theta(x | s)
+    # ------------------------------------------------------------------
+
+    def compute_loglik_mc_p(
+        self,
+        X: torch.Tensor,
+        S: torch.Tensor,
+        L: np.ndarray,
+        mask: torch.Tensor,
+        num_samples_eval: int | None = None,
+    ) -> torch.Tensor:
+        """Estimate log p_theta(x | s) via Monte Carlo sampling from p_theta(z | x_{z_{<i}}, s).
+
+        For each batch element b:
+          1. Sequentially sample a permutation z^(k) under the learned order prior p_theta,
+             using the partial autoregressive mask (_build_partial_ar_mask) and teacher forcing.
+          2. Given the completed permutation, run forward_p once with the full permutation
+             to obtain log p_theta(x | z^(k), s).
+          3. Average over K permutations with a simple Monte Carlo estimator:
+                 log p_theta(x | s) ~= log (1/K sum_k p_theta(x | z^(k), s)).
+
+        Args:
+            X: coordinates [B, N, 4, 3].
+            S: ground-truth sequence [B, N].
+            L: lengths array (np).
+            mask: padding mask [B, N].
+            num_samples_eval: number of Monte Carlo samples K. If None, a default
+                value of 8 is used.
+
+        Returns:
+            loglik_per_res: [B] per-residue log-likelihood estimates
+                log p_theta(x | s) / L_b for each batch element.
+        """
+        B, N = S.shape
+        device = S.device
+
+        h_V_enc, h_E, E_idx, _ = self._encode(X, L, mask)
+
+        L_tensor = torch.tensor(L, dtype=torch.float32, device=device)
+
+        K_eval = num_samples_eval if num_samples_eval is not None else 8
+        if K_eval < 1:
+            raise ValueError("num_samples_eval must be >= 1.")
+
+        max_steps = int(L_tensor.max().item())
+
+        log_terms: list[torch.Tensor] = []
+
+        for _ in range(K_eval):
+            # decode_step[b, j] stores the step index at which position j was decoded
+            # (0-based). Undecoded positions have value N.
+            decode_step = torch.full(
+                (B, N),
+                fill_value=N,
+                dtype=torch.long,
+                device=device,
+            )
+            decoded_mask = torch.zeros(B, N, dtype=torch.float32, device=device)
+
+            # Sequentially sample a permutation under p_theta
+            for _step in range(max_steps):
+                remaining = mask * (1.0 - decoded_mask)
+
+                # If no valid positions remain in any sequence, stop.
+                if remaining.sum() == 0:
+                    break
+
+                # Build a full permutation consistent with current decoded order.
+                # Positions are ordered by decode_step (decoded first, in order of
+                # their decode time; undecoded and padded positions follow).
+                full_perm = torch.argsort(decode_step, dim=1)
+
+                decoded_count = decoded_mask.sum(dim=1).long()
+                i_samples = torch.clamp(
+                    decoded_count + 1,
+                    max=L_tensor.long(),
+                )
+
+                ar_mask = self._build_partial_ar_mask(E_idx, full_perm, i_samples)
+
+                log_probs_step, p_order_logits_step = self.forward_p(
+                    h_V_enc,
+                    h_E,
+                    E_idx,
+                    S,
+                    mask,
+                    ar_mask=ar_mask,
+                )
+
+                # Sample next position z_i from p_theta(z_i | z_{<i}, x_{z_{<i}}, s)
+                order_logits = p_order_logits_step.masked_fill(
+                    remaining == 0,
+                    float("-inf"),
+                )
+
+                # Only sample for batch elements that still have remaining positions.
+                active = remaining.sum(dim=1) > 0
+                if not torch.any(active):
+                    break
+
+                order_logits_active = order_logits[active]
+                order_probs_active = F.softmax(order_logits_active, dim=-1)
+
+                pos_active = torch.multinomial(order_probs_active, 1).squeeze(-1)
+
+                batch_idx = torch.arange(B, device=device)[active]
+                decoded_mask[batch_idx, pos_active] = 1.0
+                decoded_count_active = decoded_count[batch_idx]
+                decode_step[batch_idx, pos_active] = decoded_count_active
+
+            # After finishing sequential sampling, construct the final permutation
+            # from the decode_step matrix.
+            full_perm_final = torch.argsort(decode_step, dim=1)
+
+            log_probs_k, _ = self.forward_p(
+                h_V_enc,
+                h_E,
+                E_idx,
+                S,
+                mask,
+                permutation=full_perm_final,
+            )
+
+            log_p_token = torch.gather(
+                log_probs_k,
+                2,
+                S.unsqueeze(-1),
+            ).squeeze(-1)
+            log_p_x_given_z = (log_p_token * mask).sum(-1)
+
+            log_terms.append(log_p_x_given_z)
+
+        log_terms_stack = torch.stack(log_terms, dim=0)
+        log_p_x_given_s = torch.logsumexp(log_terms_stack, dim=0) - float(np.log(K_eval))
+
+        loglik_per_res = log_p_x_given_s / L_tensor
+        return loglik_per_res
+
+    # ------------------------------------------------------------------
     # Forward (convenience wrapper matching original Struct2Seq interface)
     # ------------------------------------------------------------------
 

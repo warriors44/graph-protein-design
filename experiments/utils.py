@@ -56,8 +56,11 @@ def get_args():
         '--eval_mode',
         type=str,
         default='fixed',
-        choices=['fixed', 'is_q'],
-        help='Evaluation mode for LO-ARM: fixed N->C order or q-based importance sampling',
+        choices=['fixed', 'is_q', 'mc_p'],
+        help=(
+            'Evaluation mode for LO-ARM: fixed N->C order, '
+            'q-based importance sampling (is_q), or p-theta-only Monte Carlo (mc_p)'
+        ),
     )
     parser.add_argument(
         '--eval_num_samples',
