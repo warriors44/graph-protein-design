@@ -141,10 +141,28 @@ def main() -> None:
             val_sum, val_weights = 0., 0.
             for _, batch in enumerate(loader_validation):
                 X, S, mask, lengths = featurize(batch, device)
-                log_probs = model(X, S, lengths, mask)
-                loss_per_res, loss_avg = loss_nll(S, log_probs, mask)
-                val_sum += torch.sum(loss_per_res * mask).cpu().item()
-                val_weights += torch.sum(mask).cpu().item()
+
+                if args.eval_mode == 'is_q':
+                    loglik_per_res = model.compute_loglik_is_q(
+                        X,
+                        S,
+                        lengths,
+                        mask,
+                        num_samples_eval=args.eval_num_samples,
+                    )
+                    L_tensor = torch.tensor(
+                        lengths,
+                        dtype=torch.float32,
+                        device=loglik_per_res.device,
+                    )
+                    nll_batch = -(loglik_per_res * L_tensor).sum().cpu().item()
+                    val_sum += nll_batch
+                    val_weights += L_tensor.sum().cpu().item()
+                else:
+                    log_probs = model(X, S, lengths, mask)
+                    loss_per_res, loss_avg = loss_nll(S, log_probs, mask)
+                    val_sum += torch.sum(loss_per_res * mask).cpu().item()
+                    val_weights += torch.sum(mask).cpu().item()
 
         train_elbo = train_elbo_sum / train_weights
         train_nll = train_nll_sum / train_weights
@@ -187,10 +205,28 @@ def main() -> None:
         test_sum, test_weights = 0., 0.
         for _, batch in enumerate(loader_test):
             X, S, mask, lengths = featurize(batch, device)
-            log_probs = model(X, S, lengths, mask)
-            loss_per_res, _ = loss_nll(S, log_probs, mask)
-            test_sum += torch.sum(loss_per_res * mask).cpu().item()
-            test_weights += torch.sum(mask).cpu().item()
+
+            if args.eval_mode == 'is_q':
+                loglik_per_res = model.compute_loglik_is_q(
+                    X,
+                    S,
+                    lengths,
+                    mask,
+                    num_samples_eval=args.eval_num_samples,
+                )
+                L_tensor = torch.tensor(
+                    lengths,
+                    dtype=torch.float32,
+                    device=loglik_per_res.device,
+                )
+                nll_batch = -(loglik_per_res * L_tensor).sum().cpu().item()
+                test_sum += nll_batch
+                test_weights += L_tensor.sum().cpu().item()
+            else:
+                log_probs = model(X, S, lengths, mask)
+                loss_per_res, _ = loss_nll(S, log_probs, mask)
+                test_sum += torch.sum(loss_per_res * mask).cpu().item()
+                test_weights += torch.sum(mask).cpu().item()
 
     test_ppl = np.exp(test_sum / test_weights)
     print('Perplexity\tTest:{}'.format(test_ppl))

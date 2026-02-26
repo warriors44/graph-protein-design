@@ -52,6 +52,19 @@ def get_args():
         choices=['shared', 'separate'],
         help='Architecture for q_theta: shared torso or separate network',
     )
+    parser.add_argument(
+        '--eval_mode',
+        type=str,
+        default='fixed',
+        choices=['fixed', 'is_q'],
+        help='Evaluation mode for LO-ARM: fixed N->C order or q-based importance sampling',
+    )
+    parser.add_argument(
+        '--eval_num_samples',
+        type=int,
+        default=8,
+        help='Number of importance samples (K_eval) for q-based evaluation',
+    )
     args = parser.parse_args()
     return args
 

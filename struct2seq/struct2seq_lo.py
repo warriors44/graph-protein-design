@@ -528,6 +528,89 @@ class Struct2SeqLO(nn.Module):
         return loss, info
 
     # ------------------------------------------------------------------
+    # q-based importance sampling estimate of log p_theta(x | s)
+    # ------------------------------------------------------------------
+
+    def compute_loglik_is_q(
+        self,
+        X: torch.Tensor,
+        S: torch.Tensor,
+        L: np.ndarray,
+        mask: torch.Tensor,
+        num_samples_eval: int | None = None,
+    ) -> torch.Tensor:
+        """Estimate log p_theta(x | s) via importance sampling with q_theta(z | x, s).
+
+        For each batch element b:
+          1. Sample K permutations z^(k) ~ q_theta(z | x, s) via Plackett-Luce.
+          2. For each z^(k), run forward_p with permutation=z^(k) under teacher forcing
+             to obtain log p_theta(x | z^(k), s).
+          3. Compute log p_theta(z^(k) | s) and log q_theta(z^(k) | x, s) using the
+             Plackett-Luce log-probabilities.
+          4. Form importance weights w_k = p(z^(k) | s) / q(z^(k) | x, s) and use
+             log-sum-exp to approximate log p_theta(x | s).
+
+        Args:
+            X: coordinates [B, N, 4, 3].
+            S: ground-truth sequence [B, N].
+            L: lengths array (np).
+            mask: padding mask [B, N].
+            num_samples_eval: number of importance samples K. If None, a default
+                value of 8 is used.
+
+        Returns:
+            loglik_per_res: [B] per-residue log-likelihood estimates
+                log p_theta(x | s) / L_b for each batch element.
+        """
+        B, N = S.shape
+        device = S.device
+
+        h_V_enc, h_E, E_idx, _ = self._encode(X, L, mask)
+        q_logits = self.forward_q(h_V_enc, h_E, E_idx, S, mask)
+
+        L_tensor = torch.tensor(L, dtype=torch.float32, device=device)
+
+        K_eval = num_samples_eval if num_samples_eval is not None else 8
+        if K_eval < 1:
+            raise ValueError("num_samples_eval must be >= 1.")
+
+        log_terms: list[torch.Tensor] = []
+
+        for _ in range(K_eval):
+            full_perm = gumbel_top_k(q_logits.detach())
+
+            log_probs_k, p_order_logits_k = self.forward_p(
+                h_V_enc,
+                h_E,
+                E_idx,
+                S,
+                mask,
+                permutation=full_perm,
+            )
+
+            log_p_token = torch.gather(
+                log_probs_k,
+                2,
+                S.unsqueeze(-1),
+            ).squeeze(-1)
+            log_p_x_given_z = (log_p_token * mask).sum(-1)
+
+            log_q_all = plackett_luce_log_prob(q_logits, full_perm, mask)
+            log_q_z = (log_q_all * mask).sum(-1)
+
+            log_p_all = plackett_luce_log_prob(p_order_logits_k, full_perm, mask)
+            log_p_z = (log_p_all * mask).sum(-1)
+
+            log_weight = log_p_z - log_q_z
+            log_terms.append(log_weight + log_p_x_given_z)
+
+        log_terms_stack = torch.stack(log_terms, dim=0)
+        log_p_x_given_s = torch.logsumexp(log_terms_stack, dim=0) - float(np.log(K_eval))
+
+        loglik_per_res = log_p_x_given_s / L_tensor
+        return loglik_per_res
+
+    # ------------------------------------------------------------------
     # Forward (convenience wrapper matching original Struct2Seq interface)
     # ------------------------------------------------------------------
 

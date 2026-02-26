@@ -88,6 +88,29 @@ def test_basic() -> None:
         print(f"  p_grad_norm = {p_norm:.6f}")
 
 
+def test_loglik_is_q_basic() -> None:
+    """Basic sanity check for compute_loglik_is_q.
+
+    Ensures that the importance-sampling estimator returns finite
+    per-residue log-likelihoods for a small random problem.
+    """
+    torch.manual_seed(0)
+    model, X, S, lengths, mask = _make_model_and_data()
+
+    loglik_per_res = model.compute_loglik_is_q(
+        X,
+        S,
+        lengths,
+        mask,
+        num_samples_eval=2,
+    )
+
+    assert loglik_per_res.shape == (S.size(0),)
+    assert torch.isfinite(loglik_per_res).all(), (
+        f"loglik_per_res must be finite, got {loglik_per_res}"
+    )
+
+
 def test_edge_i_equals_1() -> None:
     """When i=1 for all batch elements, no positions are decoded yet."""
     torch.manual_seed(0)
@@ -160,4 +183,5 @@ if __name__ == '__main__':
     test_basic()
     test_edge_i_equals_1()
     test_edge_i_equals_L()
+    test_loglik_is_q_basic()
     print("\nALL TESTS PASSED")
