@@ -11,9 +11,13 @@
 *.json
 *.jsonl
 *.pt
-
+*.e*
+*.o*
 
 
 __pycache__/
 
 .venv/
+data
+.cursor/
+.cursorignore
