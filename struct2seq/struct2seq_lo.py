@@ -507,7 +507,10 @@ class Struct2SeqLO(nn.Module):
 
         h_V_enc, h_E, E_idx, _ = self._encode(X, L, mask)
 
-        h_V_enc_q, _, _, _ = self._encode_q(X, L, mask)
+        if self.separate_encoder:
+            h_V_enc_q, _, _, _ = self._encode_q(X, L, mask)
+        else:
+            h_V_enc_q = h_V_enc
         q_logits = self.forward_q(h_V_enc_q, h_E, E_idx, S, mask)
 
         L_tensor = torch.tensor(L, dtype=torch.float, device=device)
@@ -635,7 +638,10 @@ class Struct2SeqLO(nn.Module):
 
         h_V_enc, h_E, E_idx, _ = self._encode(X, L, mask)
 
-        h_V_enc_q, _, _, _ = self._encode_q(X, L, mask)
+        if self.separate_encoder:
+            h_V_enc_q, _, _, _ = self._encode_q(X, L, mask)
+        else:
+            h_V_enc_q = h_V_enc
         q_logits = self.forward_q(h_V_enc_q, h_E, E_idx, S, mask)
 
         L_tensor = torch.tensor(L, dtype=torch.float32, device=device)
