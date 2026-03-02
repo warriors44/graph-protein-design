@@ -26,6 +26,36 @@ def get_args():
     parser.add_argument('--model_type', type=str, default='structure', help='Enrich with alignments')
     parser.add_argument('--mpnn', action='store_true', help='Use MPNN updates instead of attention')
 
+    # Per-component architecture options (mutually exclusive with --mpnn)
+    parser.add_argument(
+        '--p_encoder_arch',
+        type=str,
+        default=None,
+        choices=['transformer', 'mpnn'],
+        help='Architecture for p_theta encoder (transformer or mpnn).',
+    )
+    parser.add_argument(
+        '--p_decoder_arch',
+        type=str,
+        default=None,
+        choices=['transformer', 'mpnn'],
+        help='Architecture for p_theta decoder (transformer or mpnn).',
+    )
+    parser.add_argument(
+        '--q_encoder_arch',
+        type=str,
+        default=None,
+        choices=['transformer', 'mpnn'],
+        help='Architecture for q_theta encoder (transformer or mpnn, structure_lo only).',
+    )
+    parser.add_argument(
+        '--q_decoder_arch',
+        type=str,
+        default=None,
+        choices=['transformer', 'mpnn'],
+        help='Architecture for q_theta decoder (transformer or mpnn, structure_lo only).',
+    )
+
     parser.add_argument('--restore', type=str, default='', help='Checkpoint file for restoration')
     parser.add_argument('--name', type=str, default='', help='Experiment name for logging')
     parser.add_argument('--file_data', type=str, default='../data/cath/chain_set.jsonl', help='input chain file')
@@ -69,6 +99,81 @@ def get_args():
         help='Number of importance samples (K_eval) for q-based evaluation',
     )
     args = parser.parse_args()
+
+    # ------------------------------------------------------------------
+    # Architecture option validation and normalization
+    # ------------------------------------------------------------------
+    arch_opts = [
+        args.p_encoder_arch,
+        args.p_decoder_arch,
+        args.q_encoder_arch,
+        args.q_decoder_arch,
+    ]
+    any_arch_specified = any(opt is not None for opt in arch_opts)
+
+    # Per-component options are only supported for structure-based models.
+    if any_arch_specified and args.model_type not in ('structure', 'structure_lo'):
+        parser.error(
+            '--p_*_arch / --q_*_arch options are only supported for '
+            "model_type 'structure' or 'structure_lo'.",
+        )
+
+    if any_arch_specified:
+        # Legacy --mpnn flag cannot be combined with per-component options.
+        if args.mpnn:
+            parser.error(
+                '--mpnn cannot be used together with per-component '
+                'architecture options (--p_*_arch / --q_*_arch).',
+            )
+
+        # q_theta-specific options only make sense for structure_lo.
+        if args.model_type != 'structure_lo':
+            if args.q_encoder_arch is not None or args.q_decoder_arch is not None:
+                parser.error(
+                    '--q_encoder_arch / --q_decoder_arch are only valid '
+                    "when --model_type structure_lo.",
+                )
+
+        # When q_arch is shared, q_*_arch options are not meaningful.
+        if args.model_type == 'structure_lo' and args.q_arch == 'shared':
+            if args.q_encoder_arch is not None or args.q_decoder_arch is not None:
+                parser.error(
+                    '--q_*_arch options cannot be used when --q_arch shared '
+                    '(q_theta shares the torso with p_theta). Use '
+                    '--q_arch separate to enable separate q_theta decoder.',
+                )
+
+        # In per-component mode, require explicit p_theta encoder/decoder arch.
+        if args.p_encoder_arch is None or args.p_decoder_arch is None:
+            parser.error(
+                'Per-component architecture mode requires both '
+                '--p_encoder_arch and --p_decoder_arch to be specified.',
+            )
+
+        # For now the encoder is shared between p_theta and q_theta, so
+        # q_encoder_arch must match p_encoder_arch if provided.
+        if (
+            args.model_type == 'structure_lo'
+            and args.q_encoder_arch is not None
+            and args.q_encoder_arch != args.p_encoder_arch
+        ):
+            parser.error(
+                '--q_encoder_arch must match --p_encoder_arch because the '
+                'encoder is shared between p_theta and q_theta.',
+            )
+
+        # For structure_lo with separate q_theta torso, default missing
+        # q_*_arch to p_*_arch for convenience.
+        if args.model_type == 'structure_lo' and args.q_arch == 'separate':
+            if args.q_encoder_arch is None:
+                args.q_encoder_arch = args.p_encoder_arch
+            if args.q_decoder_arch is None:
+                args.q_decoder_arch = args.p_decoder_arch
+
+        args.arch_mode = 'per_component'
+    else:
+        args.arch_mode = 'legacy'
+
     return args
 
 def setup_device_rng(args):
@@ -88,16 +193,30 @@ def setup_device_rng(args):
 def setup_model(hyperparams, device):
     # Build the model
     if hyperparams['model_type'] == 'structure':
-        model = struct2seq.Struct2Seq(
-            num_letters=hyperparams['vocab_size'], 
-            node_features=hyperparams['hidden'],
-            edge_features=hyperparams['hidden'], 
-            hidden_dim=hyperparams['hidden'],
-            k_neighbors=hyperparams['k_neighbors'],
-            protein_features=hyperparams['features'],
-            dropout=hyperparams['dropout'],
-            use_mpnn=hyperparams['mpnn']
-        ).to(device)
+        if hyperparams.get('arch_mode', 'legacy') == 'per_component':
+            model = struct2seq.Struct2Seq(
+                num_letters=hyperparams['vocab_size'],
+                node_features=hyperparams['hidden'],
+                edge_features=hyperparams['hidden'],
+                hidden_dim=hyperparams['hidden'],
+                k_neighbors=hyperparams['k_neighbors'],
+                protein_features=hyperparams['features'],
+                dropout=hyperparams['dropout'],
+                use_mpnn=False,
+                encoder_arch=hyperparams['p_encoder_arch'],
+                decoder_arch=hyperparams['p_decoder_arch'],
+            ).to(device)
+        else:
+            model = struct2seq.Struct2Seq(
+                num_letters=hyperparams['vocab_size'],
+                node_features=hyperparams['hidden'],
+                edge_features=hyperparams['hidden'],
+                hidden_dim=hyperparams['hidden'],
+                k_neighbors=hyperparams['k_neighbors'],
+                protein_features=hyperparams['features'],
+                dropout=hyperparams['dropout'],
+                use_mpnn=hyperparams['mpnn'],
+            ).to(device)
     elif hyperparams['model_type'] == 'sequence':
         model = seq_model.SequenceModel(
             num_letters=hyperparams['vocab_size'],
@@ -110,18 +229,52 @@ def setup_model(hyperparams, device):
             hidden_dim=hyperparams['hidden']
         ).to(device)
     elif hyperparams['model_type'] == 'structure_lo':
-        model = struct2seq_lo.Struct2SeqLO(
-            num_letters=hyperparams['vocab_size'],
-            node_features=hyperparams['hidden'],
-            edge_features=hyperparams['hidden'],
-            hidden_dim=hyperparams['hidden'],
-            k_neighbors=hyperparams['k_neighbors'],
-            protein_features=hyperparams['features'],
-            dropout=hyperparams['dropout'],
-            use_mpnn=hyperparams['mpnn'],
-            num_samples=hyperparams.get('num_samples', 2),
-            q_arch=hyperparams.get('q_arch', 'shared'),
-        ).to(device)
+        if hyperparams.get('arch_mode', 'legacy') == 'per_component':
+            model = struct2seq_lo.Struct2SeqLO(
+                num_letters=hyperparams['vocab_size'],
+                node_features=hyperparams['hidden'],
+                edge_features=hyperparams['hidden'],
+                hidden_dim=hyperparams['hidden'],
+                k_neighbors=hyperparams['k_neighbors'],
+                protein_features=hyperparams['features'],
+                dropout=hyperparams['dropout'],
+                use_mpnn=False,
+                num_samples=hyperparams.get('num_samples', 2),
+                q_arch=hyperparams.get('q_arch', 'shared'),
+                p_encoder_arch=hyperparams['p_encoder_arch'],
+                p_decoder_arch=hyperparams['p_decoder_arch'],
+                q_encoder_arch=hyperparams.get('q_encoder_arch'),
+                q_decoder_arch=hyperparams.get('q_decoder_arch'),
+            ).to(device)
+        else:
+            model = struct2seq_lo.Struct2SeqLO(
+                num_letters=hyperparams['vocab_size'],
+                node_features=hyperparams['hidden'],
+                edge_features=hyperparams['hidden'],
+                hidden_dim=hyperparams['hidden'],
+                k_neighbors=hyperparams['k_neighbors'],
+                protein_features=hyperparams['features'],
+                dropout=hyperparams['dropout'],
+                use_mpnn=hyperparams['mpnn'],
+                num_samples=hyperparams.get('num_samples', 2),
+                q_arch=hyperparams.get('q_arch', 'shared'),
+            ).to(device)
+
+    # Simple architecture summary for debugging.
+    if isinstance(model, struct2seq.Struct2Seq):
+        print(
+            f"Struct2Seq architectures: encoder={model.encoder_arch}, "
+            f"decoder={model.decoder_arch}",
+        )
+    elif isinstance(model, struct2seq_lo.Struct2SeqLO):
+        print(
+            "Struct2SeqLO architectures: "
+            f"p_encoder={model.p_encoder_arch}, "
+            f"p_decoder={model.p_decoder_arch}, "
+            f"q_encoder={model.q_encoder_arch}, "
+            f"q_decoder={model.q_decoder_arch}, "
+            f"q_arch={model.q_arch}",
+        )
 
     print('Number of parameters: {}'.format(sum([p.numel() for p in model.parameters()])))
     return model

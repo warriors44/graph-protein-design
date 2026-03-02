@@ -46,6 +46,10 @@ class Struct2SeqLO(nn.Module):
         use_mpnn: bool = False,
         num_samples: int = 2,
         q_arch: str = "shared",
+        p_encoder_arch: str = "transformer",
+        p_decoder_arch: str = "transformer",
+        q_encoder_arch: str | None = None,
+        q_decoder_arch: str | None = None,
     ) -> None:
         super(Struct2SeqLO, self).__init__()
 
@@ -65,8 +69,11 @@ class Struct2SeqLO(nn.Module):
 
         # Featurization
         self.features = ProteinFeatures(
-            node_features, edge_features, top_k=k_neighbors,
-            features_type=protein_features, augment_eps=augment_eps,
+            node_features,
+            edge_features,
+            top_k=k_neighbors,
+            features_type=protein_features,
+            augment_eps=augment_eps,
             dropout=dropout,
         )
 
@@ -75,20 +82,72 @@ class Struct2SeqLO(nn.Module):
         self.W_e = nn.Linear(edge_features, hidden_dim, bias=True)
         self.W_s = nn.Embedding(vocab, hidden_dim)
 
-        layer = TransformerLayer if not use_mpnn else MPNNLayer
+        # Normalize architecture choices with backward compatibility for use_mpnn.
+        if p_encoder_arch not in ("transformer", "mpnn"):
+            raise ValueError(
+                "p_encoder_arch must be 'transformer' or 'mpnn', "
+                f"got {p_encoder_arch!r}.",
+            )
+        if p_decoder_arch not in ("transformer", "mpnn"):
+            raise ValueError(
+                "p_decoder_arch must be 'transformer' or 'mpnn', "
+                f"got {p_decoder_arch!r}.",
+            )
+        if q_encoder_arch is not None and q_encoder_arch not in ("transformer", "mpnn"):
+            raise ValueError(
+                "q_encoder_arch must be 'transformer' or 'mpnn' when set, "
+                f"got {q_encoder_arch!r}.",
+            )
+        if q_decoder_arch is not None and q_decoder_arch not in ("transformer", "mpnn"):
+            raise ValueError(
+                "q_decoder_arch must be 'transformer' or 'mpnn' when set, "
+                f"got {q_decoder_arch!r}.",
+            )
 
-        # Shared encoder
-        self.encoder_layers = nn.ModuleList([
-            layer(hidden_dim, hidden_dim * 2, dropout=dropout)
-            for _ in range(num_encoder_layers)
-        ])
+        # Legacy behaviour: if use_mpnn is set and p_*_arch are left at
+        # their defaults, upgrade them both to MPNN.
+        if (
+            use_mpnn
+            and p_encoder_arch == "transformer"
+            and p_decoder_arch == "transformer"
+        ):
+            p_encoder_arch = "mpnn"
+            p_decoder_arch = "mpnn"
 
-        # Shared decoder
+        # If q_*_arch are not provided, mirror p_theta architectures.
+        if q_encoder_arch is None:
+            q_encoder_arch = p_encoder_arch
+        if q_decoder_arch is None:
+            q_decoder_arch = p_decoder_arch
+
+        self.p_encoder_arch = p_encoder_arch
+        self.p_decoder_arch = p_decoder_arch
+        self.q_encoder_arch = q_encoder_arch
+        self.q_decoder_arch = q_decoder_arch
+
+        enc_layer = (
+            TransformerLayer if p_encoder_arch == "transformer" else MPNNLayer
+        )
+        dec_layer = (
+            TransformerLayer if p_decoder_arch == "transformer" else MPNNLayer
+        )
+
+        # Encoder shared between p_theta and q_theta paths.
+        self.encoder_layers = nn.ModuleList(
+            [
+                enc_layer(hidden_dim, hidden_dim * 2, dropout=dropout)
+                for _ in range(num_encoder_layers)
+            ],
+        )
+
+        # Shared decoder for p_theta (and optionally q_theta).
         self.forward_attention_decoder = forward_attention_decoder
-        self.decoder_layers = nn.ModuleList([
-            layer(hidden_dim, hidden_dim * 3, dropout=dropout)
-            for _ in range(num_decoder_layers)
-        ])
+        self.decoder_layers = nn.ModuleList(
+            [
+                dec_layer(hidden_dim, hidden_dim * 3, dropout=dropout)
+                for _ in range(num_decoder_layers)
+            ],
+        )
 
         # Token prediction head (shared)
         self.W_out = nn.Linear(hidden_dim, num_letters, bias=True)
@@ -107,10 +166,17 @@ class Struct2SeqLO(nn.Module):
 
         # Optional separate torso for q_theta (variational order posterior)
         if self.q_arch == "separate":
-            self.q_decoder_layers = nn.ModuleList([
-                layer(hidden_dim, hidden_dim * 3, dropout=dropout)
-                for _ in range(num_decoder_layers)
-            ])
+            q_dec_layer = (
+                TransformerLayer
+                if self.q_decoder_arch == "transformer"
+                else MPNNLayer
+            )
+            self.q_decoder_layers = nn.ModuleList(
+                [
+                    q_dec_layer(hidden_dim, hidden_dim * 3, dropout=dropout)
+                    for _ in range(num_decoder_layers)
+                ],
+            )
             self.W_order_q_sep = nn.Sequential(
                 nn.Linear(hidden_dim, hidden_dim),
                 nn.ReLU(),

@@ -17,10 +17,24 @@ from .self_attention import (
 from .protein_features import ProteinFeatures
 
 class Struct2Seq(nn.Module):
-    def __init__(self, num_letters: int, node_features: int, edge_features: int,
-        hidden_dim: int, num_encoder_layers: int = 3, num_decoder_layers: int = 3,
-        vocab: int = 20, k_neighbors: int = 30, protein_features: str = 'full', augment_eps: float = 0.,
-        dropout: float = 0.1, forward_attention_decoder: bool = True, use_mpnn: bool = False) -> None:
+    def __init__(
+        self,
+        num_letters: int,
+        node_features: int,
+        edge_features: int,
+        hidden_dim: int,
+        num_encoder_layers: int = 3,
+        num_decoder_layers: int = 3,
+        vocab: int = 20,
+        k_neighbors: int = 30,
+        protein_features: str = 'full',
+        augment_eps: float = 0.,
+        dropout: float = 0.1,
+        forward_attention_decoder: bool = True,
+        use_mpnn: bool = False,
+        encoder_arch: str = 'transformer',
+        decoder_arch: str = 'transformer',
+    ) -> None:
         """ Graph labeling network """
         super(Struct2Seq, self).__init__()
 
@@ -40,18 +54,39 @@ class Struct2Seq(nn.Module):
         self.W_v = nn.Linear(node_features, hidden_dim, bias=True)
         self.W_e = nn.Linear(edge_features, hidden_dim, bias=True)
         self.W_s = nn.Embedding(vocab, hidden_dim)
-        layer = TransformerLayer if not use_mpnn else MPNNLayer
+
+        # Normalize architecture choices with backward compatibility for use_mpnn.
+        if encoder_arch not in ('transformer', 'mpnn'):
+            raise ValueError(
+                f"encoder_arch must be 'transformer' or 'mpnn', got {encoder_arch!r}.",
+            )
+        if decoder_arch not in ('transformer', 'mpnn'):
+            raise ValueError(
+                f"decoder_arch must be 'transformer' or 'mpnn', got {decoder_arch!r}.",
+            )
+
+        # Legacy behaviour: if use_mpnn is set and no explicit architectures
+        # were provided (left at default), upgrade both to MPNN.
+        if use_mpnn and encoder_arch == 'transformer' and decoder_arch == 'transformer':
+            encoder_arch = 'mpnn'
+            decoder_arch = 'mpnn'
+
+        self.encoder_arch = encoder_arch
+        self.decoder_arch = decoder_arch
+
+        enc_layer = TransformerLayer if encoder_arch == 'transformer' else MPNNLayer
+        dec_layer = TransformerLayer if decoder_arch == 'transformer' else MPNNLayer
 
         # Encoder layers
         self.encoder_layers = nn.ModuleList([
-            layer(hidden_dim, hidden_dim*2, dropout=dropout)
+            enc_layer(hidden_dim, hidden_dim*2, dropout=dropout)
             for _ in range(num_encoder_layers)
         ])
 
         # Decoder layers
         self.forward_attention_decoder = forward_attention_decoder
         self.decoder_layers = nn.ModuleList([
-            layer(hidden_dim, hidden_dim*3, dropout=dropout)
+            dec_layer(hidden_dim, hidden_dim*3, dropout=dropout)
             for _ in range(num_decoder_layers)
         ])
         self.W_out = nn.Linear(hidden_dim, num_letters, bias=True)
