@@ -30,7 +30,8 @@ def main() -> None:
         k_neighbors=args.k_neighbors,
         protein_features=args.features,
         dropout=args.dropout,
-        use_mpnn=args.mpnn,
+        encoder_arch=args.p_encoder_arch,
+        decoder_arch=args.p_decoder_arch,
     ).to(device)
     print("Number of parameters: {}".format(sum(p.numel() for p in model.parameters())))
 

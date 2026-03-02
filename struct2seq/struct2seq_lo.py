@@ -43,29 +43,51 @@ class Struct2SeqLO(nn.Module):
         augment_eps: float = 0.,
         dropout: float = 0.1,
         forward_attention_decoder: bool = True,
-        use_mpnn: bool = False,
         num_samples: int = 2,
-        q_arch: str = "shared",
         p_encoder_arch: str = "transformer",
         p_decoder_arch: str = "transformer",
-        q_encoder_arch: str | None = None,
-        q_decoder_arch: str | None = None,
+        q_encoder_arch: str = "transformer",
+        q_decoder_arch: str = "transformer",
+        separate_encoder: bool = False,
+        separate_decoder: bool = False,
     ) -> None:
         super(Struct2SeqLO, self).__init__()
 
         if num_samples < 2:
             raise ValueError("num_samples must be >= 2 for RLOO estimator.")
 
-        if q_arch not in ("shared", "separate"):
+        for name, val in [
+            ("p_encoder_arch", p_encoder_arch),
+            ("p_decoder_arch", p_decoder_arch),
+            ("q_encoder_arch", q_encoder_arch),
+            ("q_decoder_arch", q_decoder_arch),
+        ]:
+            if val not in ("transformer", "mpnn"):
+                raise ValueError(
+                    f"{name} must be 'transformer' or 'mpnn', got {val!r}.",
+                )
+
+        if not separate_encoder and p_encoder_arch != q_encoder_arch:
             raise ValueError(
-                f"q_arch must be 'shared' or 'separate', got {q_arch!r}",
+                "p_encoder_arch and q_encoder_arch must match when "
+                "separate_encoder is False.",
+            )
+        if not separate_decoder and p_decoder_arch != q_decoder_arch:
+            raise ValueError(
+                "p_decoder_arch and q_decoder_arch must match when "
+                "separate_decoder is False.",
             )
 
         self.node_features = node_features
         self.edge_features = edge_features
         self.hidden_dim = hidden_dim
         self.num_samples = num_samples
-        self.q_arch = q_arch
+        self.p_encoder_arch = p_encoder_arch
+        self.p_decoder_arch = p_decoder_arch
+        self.q_encoder_arch = q_encoder_arch
+        self.q_decoder_arch = q_decoder_arch
+        self.separate_encoder = separate_encoder
+        self.separate_decoder = separate_decoder
 
         # Featurization
         self.features = ProteinFeatures(
@@ -82,74 +104,25 @@ class Struct2SeqLO(nn.Module):
         self.W_e = nn.Linear(edge_features, hidden_dim, bias=True)
         self.W_s = nn.Embedding(vocab, hidden_dim)
 
-        # Normalize architecture choices with backward compatibility for use_mpnn.
-        if p_encoder_arch not in ("transformer", "mpnn"):
-            raise ValueError(
-                "p_encoder_arch must be 'transformer' or 'mpnn', "
-                f"got {p_encoder_arch!r}.",
-            )
-        if p_decoder_arch not in ("transformer", "mpnn"):
-            raise ValueError(
-                "p_decoder_arch must be 'transformer' or 'mpnn', "
-                f"got {p_decoder_arch!r}.",
-            )
-        if q_encoder_arch is not None and q_encoder_arch not in ("transformer", "mpnn"):
-            raise ValueError(
-                "q_encoder_arch must be 'transformer' or 'mpnn' when set, "
-                f"got {q_encoder_arch!r}.",
-            )
-        if q_decoder_arch is not None and q_decoder_arch not in ("transformer", "mpnn"):
-            raise ValueError(
-                "q_decoder_arch must be 'transformer' or 'mpnn' when set, "
-                f"got {q_decoder_arch!r}.",
-            )
+        _layer_cls = {
+            "transformer": TransformerLayer,
+            "mpnn": MPNNLayer,
+        }
 
-        # Legacy behaviour: if use_mpnn is set and p_*_arch are left at
-        # their defaults, upgrade them both to MPNN.
-        if (
-            use_mpnn
-            and p_encoder_arch == "transformer"
-            and p_decoder_arch == "transformer"
-        ):
-            p_encoder_arch = "mpnn"
-            p_decoder_arch = "mpnn"
+        # p_theta encoder
+        self.encoder_layers = nn.ModuleList([
+            _layer_cls[p_encoder_arch](hidden_dim, hidden_dim * 2, dropout=dropout)
+            for _ in range(num_encoder_layers)
+        ])
 
-        # If q_*_arch are not provided, mirror p_theta architectures.
-        if q_encoder_arch is None:
-            q_encoder_arch = p_encoder_arch
-        if q_decoder_arch is None:
-            q_decoder_arch = p_decoder_arch
-
-        self.p_encoder_arch = p_encoder_arch
-        self.p_decoder_arch = p_decoder_arch
-        self.q_encoder_arch = q_encoder_arch
-        self.q_decoder_arch = q_decoder_arch
-
-        enc_layer = (
-            TransformerLayer if p_encoder_arch == "transformer" else MPNNLayer
-        )
-        dec_layer = (
-            TransformerLayer if p_decoder_arch == "transformer" else MPNNLayer
-        )
-
-        # Encoder shared between p_theta and q_theta paths.
-        self.encoder_layers = nn.ModuleList(
-            [
-                enc_layer(hidden_dim, hidden_dim * 2, dropout=dropout)
-                for _ in range(num_encoder_layers)
-            ],
-        )
-
-        # Shared decoder for p_theta (and optionally q_theta).
+        # p_theta decoder
         self.forward_attention_decoder = forward_attention_decoder
-        self.decoder_layers = nn.ModuleList(
-            [
-                dec_layer(hidden_dim, hidden_dim * 3, dropout=dropout)
-                for _ in range(num_decoder_layers)
-            ],
-        )
+        self.decoder_layers = nn.ModuleList([
+            _layer_cls[p_decoder_arch](hidden_dim, hidden_dim * 3, dropout=dropout)
+            for _ in range(num_decoder_layers)
+        ])
 
-        # Token prediction head (shared)
+        # Token prediction head
         self.W_out = nn.Linear(hidden_dim, num_letters, bias=True)
 
         # Order prediction heads
@@ -164,19 +137,19 @@ class Struct2SeqLO(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
 
-        # Optional separate torso for q_theta (variational order posterior)
-        if self.q_arch == "separate":
-            q_dec_layer = (
-                TransformerLayer
-                if self.q_decoder_arch == "transformer"
-                else MPNNLayer
-            )
-            self.q_decoder_layers = nn.ModuleList(
-                [
-                    q_dec_layer(hidden_dim, hidden_dim * 3, dropout=dropout)
-                    for _ in range(num_decoder_layers)
-                ],
-            )
+        # Separate q_theta encoder
+        if self.separate_encoder:
+            self.q_encoder_layers = nn.ModuleList([
+                _layer_cls[q_encoder_arch](hidden_dim, hidden_dim * 2, dropout=dropout)
+                for _ in range(num_encoder_layers)
+            ])
+
+        # Separate q_theta decoder
+        if self.separate_decoder:
+            self.q_decoder_layers = nn.ModuleList([
+                _layer_cls[q_decoder_arch](hidden_dim, hidden_dim * 3, dropout=dropout)
+                for _ in range(num_decoder_layers)
+            ])
             self.W_order_q_sep = nn.Sequential(
                 nn.Linear(hidden_dim, hidden_dim),
                 nn.ReLU(),
@@ -189,7 +162,7 @@ class Struct2SeqLO(nn.Module):
                 nn.init.xavier_uniform_(p)
 
     # ------------------------------------------------------------------
-    # Encoder (shared between p and q paths)
+    # Encoder
     # ------------------------------------------------------------------
 
     def _encode(
@@ -198,7 +171,7 @@ class Struct2SeqLO(nn.Module):
         L: np.ndarray,
         mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Run structure encoder.
+        """Run p_theta structure encoder.
 
         Returns:
             h_V: encoded node features [B, N, H]
@@ -213,6 +186,38 @@ class Struct2SeqLO(nn.Module):
         mask_attend = gather_nodes(mask.unsqueeze(-1), E_idx).squeeze(-1)
         mask_attend = mask.unsqueeze(-1) * mask_attend
         for enc_layer in self.encoder_layers:
+            h_EV = cat_neighbors_nodes(h_V, h_E, E_idx)
+            h_V = enc_layer(h_V, h_EV, mask_V=mask, mask_attend=mask_attend)
+
+        return h_V, h_E, E_idx, mask_attend
+
+    def _encode_q(
+        self,
+        X: torch.Tensor,
+        L: np.ndarray,
+        mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run q_theta structure encoder.
+
+        When separate_encoder is True, uses dedicated q_encoder_layers.
+        Otherwise delegates to _encode (shared layers).
+
+        Returns:
+            h_V: encoded node features [B, N, H]
+            h_E: encoded edge features [B, N, K, H]
+            E_idx: neighbor indices [B, N, K]
+            mask_attend_enc: encoder attention mask [B, N, K]
+        """
+        if not self.separate_encoder:
+            return self._encode(X, L, mask)
+
+        V, E, E_idx = self.features(X, L, mask)
+        h_V = self.W_v(V)
+        h_E = self.W_e(E)
+
+        mask_attend = gather_nodes(mask.unsqueeze(-1), E_idx).squeeze(-1)
+        mask_attend = mask.unsqueeze(-1) * mask_attend
+        for enc_layer in self.q_encoder_layers:
             h_EV = cat_neighbors_nodes(h_V, h_E, E_idx)
             h_V = enc_layer(h_V, h_EV, mask_V=mask, mask_attend=mask_attend)
 
@@ -329,17 +334,12 @@ class Struct2SeqLO(nn.Module):
         mask_attend = gather_nodes(mask.unsqueeze(-1), E_idx).squeeze(-1)
         mask_attend = mask.unsqueeze(-1) * mask_attend
 
-        if self.q_arch == "shared":
-            decoder_layers = self.decoder_layers
-            order_head = self.W_order_q
-        elif self.q_arch == "separate":
+        if self.separate_decoder:
             decoder_layers = self.q_decoder_layers
             order_head = self.W_order_q_sep
         else:
-            raise ValueError(
-                f"Unsupported q_arch value {self.q_arch!r}. "
-                "Expected 'shared' or 'separate'.",
-            )
+            decoder_layers = self.decoder_layers
+            order_head = self.W_order_q
 
         for dec_layer in decoder_layers:
             h_ESV = cat_neighbors_nodes(h_V, h_ES, E_idx)
@@ -506,7 +506,9 @@ class Struct2SeqLO(nn.Module):
         device = S.device
 
         h_V_enc, h_E, E_idx, _ = self._encode(X, L, mask)
-        q_logits = self.forward_q(h_V_enc, h_E, E_idx, S, mask)
+
+        h_V_enc_q, _, _, _ = self._encode_q(X, L, mask)
+        q_logits = self.forward_q(h_V_enc_q, h_E, E_idx, S, mask)
 
         L_tensor = torch.tensor(L, dtype=torch.float, device=device)
 
@@ -632,7 +634,9 @@ class Struct2SeqLO(nn.Module):
         device = S.device
 
         h_V_enc, h_E, E_idx, _ = self._encode(X, L, mask)
-        q_logits = self.forward_q(h_V_enc, h_E, E_idx, S, mask)
+
+        h_V_enc_q, _, _, _ = self._encode_q(X, L, mask)
+        q_logits = self.forward_q(h_V_enc_q, h_E, E_idx, S, mask)
 
         L_tensor = torch.tensor(L, dtype=torch.float32, device=device)
 

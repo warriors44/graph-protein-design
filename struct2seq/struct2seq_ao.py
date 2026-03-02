@@ -43,13 +43,26 @@ class Struct2SeqAO(nn.Module):
         augment_eps: float = 0.0,
         dropout: float = 0.1,
         forward_attention_decoder: bool = True,
-        use_mpnn: bool = False,
+        encoder_arch: str = "transformer",
+        decoder_arch: str = "transformer",
     ) -> None:
         super(Struct2SeqAO, self).__init__()
 
         self.node_features = node_features
         self.edge_features = edge_features
         self.hidden_dim = hidden_dim
+
+        if encoder_arch not in ("transformer", "mpnn"):
+            raise ValueError(
+                f"encoder_arch must be 'transformer' or 'mpnn', got {encoder_arch!r}.",
+            )
+        if decoder_arch not in ("transformer", "mpnn"):
+            raise ValueError(
+                f"decoder_arch must be 'transformer' or 'mpnn', got {decoder_arch!r}.",
+            )
+
+        self.encoder_arch = encoder_arch
+        self.decoder_arch = decoder_arch
 
         # Featurization
         self.features = ProteinFeatures(
@@ -66,17 +79,18 @@ class Struct2SeqAO(nn.Module):
         self.W_e = nn.Linear(edge_features, hidden_dim, bias=True)
         self.W_s = nn.Embedding(vocab, hidden_dim)
 
-        layer = TransformerLayer if not use_mpnn else MPNNLayer
+        enc_layer = TransformerLayer if encoder_arch == "transformer" else MPNNLayer
+        dec_layer = TransformerLayer if decoder_arch == "transformer" else MPNNLayer
 
-        # Shared encoder
+        # Encoder
         self.encoder_layers = nn.ModuleList(
-            [layer(hidden_dim, hidden_dim * 2, dropout=dropout) for _ in range(num_encoder_layers)]
+            [enc_layer(hidden_dim, hidden_dim * 2, dropout=dropout) for _ in range(num_encoder_layers)]
         )
 
-        # Shared decoder
+        # Decoder
         self.forward_attention_decoder = forward_attention_decoder
         self.decoder_layers = nn.ModuleList(
-            [layer(hidden_dim, hidden_dim * 3, dropout=dropout) for _ in range(num_decoder_layers)]
+            [dec_layer(hidden_dim, hidden_dim * 3, dropout=dropout) for _ in range(num_decoder_layers)]
         )
 
         # Token prediction head (shared)

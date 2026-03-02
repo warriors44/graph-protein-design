@@ -21,6 +21,13 @@ from utils import featurize, loss_nll, load_checkpoint, setup_device_rng, get_ar
 
 def main() -> None:
     args = get_args()
+
+    if args.model_type != 'structure_lo':
+        raise ValueError(
+            "train_lo.py requires --model_type structure_lo, "
+            f"got {args.model_type!r}.",
+        )
+
     device = setup_device_rng(args)
 
     # Build model
@@ -32,9 +39,13 @@ def main() -> None:
         k_neighbors=args.k_neighbors,
         protein_features=args.features,
         dropout=args.dropout,
-        use_mpnn=args.mpnn,
         num_samples=args.num_samples,
-        q_arch=args.q_arch,
+        p_encoder_arch=args.p_encoder_arch,
+        p_decoder_arch=args.p_decoder_arch,
+        q_encoder_arch=args.q_encoder_arch,
+        q_decoder_arch=args.q_decoder_arch,
+        separate_encoder=args.separate_encoder,
+        separate_decoder=args.separate_decoder,
     ).to(device)
     print('Number of parameters: {}'.format(
         sum(p.numel() for p in model.parameters())

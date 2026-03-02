@@ -46,25 +46,27 @@ source ../.venv/bin/activate
 # --batch_tokens 6000 \
 # --features full \
 # --name h128_full_mpnn \
-# --mpnn 
+# --p_encoder_arch mpnn --p_decoder_arch mpnn
 
 # python3 train_lo.py \
 # --cuda \
+# --model_type structure_lo \
 # --file_data ../data/cath/chain_set.jsonl \
 # --file_splits ../data/cath/chain_set_splits.json \
 # --batch_tokens 6000 \
 # --features full \
 # --name h128_full_mpnn_lo \
-# --mpnn
+# --p_encoder_arch mpnn --p_decoder_arch mpnn \
+# --q_encoder_arch mpnn --q_decoder_arch mpnn
 
 # python3 train_lo.py \
 # --cuda \
+# --model_type structure_lo \
 # --file_data ../data/cath/chain_set.jsonl \
 # --file_splits ../data/cath/chain_set_splits.json \
 # --batch_tokens 6000 \
 # --features full \
-# --name h128_full_transformer_lo 
-
+# --name h128_full_transformer_lo
 
 # python3 train_ao.py \
 # --cuda \
@@ -73,7 +75,7 @@ source ../.venv/bin/activate
 # --batch_tokens 6000 \
 # --features full \
 # --name h128_full_mpnn_ao \
-# --mpnn
+# --p_encoder_arch mpnn --p_decoder_arch mpnn
 
 # python3 train_ao.py \
 # --cuda \
@@ -81,50 +83,57 @@ source ../.venv/bin/activate
 # --file_splits ../data/cath/chain_set_splits.json \
 # --batch_tokens 6000 \
 # --features full \
-# --name h128_full_transformer_ao 
+# --name h128_full_transformer_ao
 
 python3 train_lo.py \
 --cuda \
+--model_type structure_lo \
 --file_data ../data/cath/chain_set.jsonl \
 --file_splits ../data/cath/chain_set_splits.json \
 --batch_tokens 6000 \
 --features full \
 --name h128_full_mpnn_lo_separate \
---mpnn \
---q_arch separate \
+--p_encoder_arch mpnn --p_decoder_arch mpnn \
+--q_encoder_arch mpnn --q_decoder_arch mpnn \
+--separate_decoder \
 --epochs 300
 
 
 python3 train_lo.py \
 --cuda \
+--model_type structure_lo \
 --file_data ../data/cath/chain_set.jsonl \
 --file_splits ../data/cath/chain_set_splits.json \
 --batch_tokens 6000 \
 --features full \
 --name h128_full_mpnn_lo_4sample \
---mpnn \
+--p_encoder_arch mpnn --p_decoder_arch mpnn \
+--q_encoder_arch mpnn --q_decoder_arch mpnn \
 --num_samples 4 \
 --epochs 300
 
 python3 train_lo.py \
 --cuda \
+--model_type structure_lo \
 --file_data ../data/cath/chain_set.jsonl \
 --file_splits ../data/cath/chain_set_splits.json \
 --batch_tokens 6000 \
 --features full \
 --name h128_full_mpnn_lo_4sample_separate \
---mpnn \
+--p_encoder_arch mpnn --p_decoder_arch mpnn \
+--q_encoder_arch mpnn --q_decoder_arch mpnn \
 --num_samples 4 \
---q_arch separate \
+--separate_decoder \
 --epochs 300
 
 python3 train_lo.py \
 --cuda \
+--model_type structure_lo \
 --file_data ../data/cath/chain_set.jsonl \
 --file_splits ../data/cath/chain_set_splits.json \
 --batch_tokens 6000 \
 --features full \
 --name h128_full_transformer_lo_4sample_separate \
 --num_samples 4 \
---q_arch separate \
---epochs 300 
+--separate_decoder \
+--epochs 300

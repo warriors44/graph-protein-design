@@ -16,7 +16,8 @@ from struct2seq.struct2seq_lo import Struct2SeqLO
 def _make_model_and_data(
     B: int = 2,
     N: int = 20,
-    q_arch: str = "shared",
+    separate_decoder: bool = False,
+    separate_encoder: bool = False,
 ) -> tuple[Struct2SeqLO, torch.Tensor, torch.Tensor, np.ndarray, torch.Tensor]:
     device = torch.device('cpu')
     model = Struct2SeqLO(
@@ -29,7 +30,8 @@ def _make_model_and_data(
         vocab=20,
         k_neighbors=10,
         dropout=0.0,
-        q_arch=q_arch,
+        separate_decoder=separate_decoder,
+        separate_encoder=separate_encoder,
     ).to(device)
     X = torch.randn(B, N, 4, 3, device=device)
     S = torch.randint(0, 20, (B, N), device=device)
@@ -43,12 +45,14 @@ def _make_model_and_data(
 def test_basic() -> None:
     """Loss is finite, requires grad, and both order heads receive gradients.
 
-    This test is run for both q_arch='shared' and q_arch='separate' to ensure
-    that the ELBO implementation supports both parameterisations.
+    Runs for both shared and separate decoder to ensure the ELBO
+    implementation supports both parameterisations.
     """
-    for q_arch in ("shared", "separate"):
+    for separate_decoder in (False, True):
         torch.manual_seed(42)
-        model, X, S, lengths, mask = _make_model_and_data(q_arch=q_arch)
+        model, X, S, lengths, mask = _make_model_and_data(
+            separate_decoder=separate_decoder,
+        )
 
         loss, info = model.compute_elbo_paper(X, S, lengths, mask)
 
@@ -65,9 +69,13 @@ def test_basic() -> None:
                 for n, p in model.named_parameters()
                 if tag in n and p.grad is not None
             )
-            assert total > 0, f"{tag} must receive non-zero gradients (q_arch={q_arch})"
+            assert total > 0, (
+                f"{tag} must receive non-zero gradients "
+                f"(separate_decoder={separate_decoder})"
+            )
 
-        print(f"test_basic PASSED (q_arch={q_arch})")
+        label = f"separate_decoder={separate_decoder}"
+        print(f"test_basic PASSED ({label})")
         print(f"  loss  = {loss.item():.4f}")
         print(f"  ELBO  = {info['elbo'].item():.4f}")
         print(f"  NLL   = {info['nll'].item():.4f}")

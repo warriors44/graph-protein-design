@@ -31,7 +31,6 @@ class Struct2Seq(nn.Module):
         augment_eps: float = 0.,
         dropout: float = 0.1,
         forward_attention_decoder: bool = True,
-        use_mpnn: bool = False,
         encoder_arch: str = 'transformer',
         decoder_arch: str = 'transformer',
     ) -> None:
@@ -55,7 +54,6 @@ class Struct2Seq(nn.Module):
         self.W_e = nn.Linear(edge_features, hidden_dim, bias=True)
         self.W_s = nn.Embedding(vocab, hidden_dim)
 
-        # Normalize architecture choices with backward compatibility for use_mpnn.
         if encoder_arch not in ('transformer', 'mpnn'):
             raise ValueError(
                 f"encoder_arch must be 'transformer' or 'mpnn', got {encoder_arch!r}.",
@@ -64,12 +62,6 @@ class Struct2Seq(nn.Module):
             raise ValueError(
                 f"decoder_arch must be 'transformer' or 'mpnn', got {decoder_arch!r}.",
             )
-
-        # Legacy behaviour: if use_mpnn is set and no explicit architectures
-        # were provided (left at default), upgrade both to MPNN.
-        if use_mpnn and encoder_arch == 'transformer' and decoder_arch == 'transformer':
-            encoder_arch = 'mpnn'
-            decoder_arch = 'mpnn'
 
         self.encoder_arch = encoder_arch
         self.decoder_arch = decoder_arch
