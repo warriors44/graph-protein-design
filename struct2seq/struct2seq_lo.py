@@ -599,6 +599,101 @@ class Struct2SeqLO(nn.Module):
         return loss, info
 
     # ------------------------------------------------------------------
+    # Sequential computation of log p(z|s) and log p(x|z,s)
+    # ------------------------------------------------------------------
+
+    def _compute_log_p_z_and_x_sequential(
+        self,
+        h_V_enc: torch.Tensor,
+        h_E: torch.Tensor,
+        E_idx: torch.Tensor,
+        S: torch.Tensor,
+        mask: torch.Tensor,
+        full_perm: torch.Tensor,
+        L: np.ndarray,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute log p_theta(z|s) and log p_theta(x|z,s) via L sequential forward_p calls.
+
+        Because p_theta's order model is a general autoregressive categorical
+        (not Plackett-Luce), each step's order logits depend on the partial
+        context z_{<i}.  We therefore need one forward_p per step, each using
+        _build_partial_ar_mask so that ALL remaining positions share the same
+        conditioning z_{<i}.
+
+        As a side effect, the token log-probability at position z_i under the
+        partial mask is identical to what forward_p(permutation=full_perm)
+        would yield, so we accumulate log p(x|z,s) here too and avoid an
+        extra forward pass.
+
+        Args:
+            h_V_enc: encoder output [B, N, H].
+            h_E: edge embeddings [B, N, K, H].
+            E_idx: neighbor indices [B, N, K].
+            S: ground-truth sequence [B, N].
+            mask: padding mask [B, N].
+            full_perm: sampled permutation [B, N].
+            L: lengths array (np).
+
+        Returns:
+            log_p_z: [B] total log p_theta(z | s) for each batch element.
+            log_p_x_given_z: [B] total log p_theta(x | z, s) for each batch.
+        """
+        B, N = S.shape
+        device = S.device
+
+        L_long = torch.tensor(L, dtype=torch.long, device=device)
+        max_L = int(L_long.max().item())
+
+        rank = torch.zeros(B, N, dtype=torch.long, device=device)
+        rank.scatter_(
+            1, full_perm,
+            torch.arange(N, device=device).unsqueeze(0).expand(B, -1),
+        )
+
+        log_p_z = torch.zeros(B, device=device)
+        log_p_x_given_z = torch.zeros(B, device=device)
+        batch_idx = torch.arange(B, device=device)
+
+        neg_inf = float('-inf')
+
+        for step in range(1, max_L + 1):
+            active = L_long >= step  # [B]
+            if not active.any():
+                break
+
+            i_samples = torch.full(
+                (B,), step, dtype=torch.long, device=device,
+            )
+            i_samples = torch.min(i_samples, L_long)
+
+            ar_mask = self._build_partial_ar_mask(E_idx, full_perm, i_samples)
+
+            log_probs_step, p_order_logits_step = self.forward_p(
+                h_V_enc, h_E, E_idx, S, mask, ar_mask=ar_mask,
+            )
+
+            z_i = full_perm[:, step - 1]  # [B]
+
+            remaining = (rank >= (step - 1)).float() * mask  # [B, N]
+            masked_logits = p_order_logits_step.masked_fill(
+                remaining == 0, neg_inf,
+            )
+            log_order_probs = F.log_softmax(masked_logits, dim=-1)
+            log_p_zi = log_order_probs[batch_idx, z_i]
+
+            log_p_token_all = torch.gather(
+                log_probs_step, 2, S.unsqueeze(-1),
+            ).squeeze(-1)
+            log_p_xi = log_p_token_all[batch_idx, z_i]
+
+            log_p_z = torch.where(active, log_p_z + log_p_zi, log_p_z)
+            log_p_x_given_z = torch.where(
+                active, log_p_x_given_z + log_p_xi, log_p_x_given_z,
+            )
+
+        return log_p_z, log_p_x_given_z
+
+    # ------------------------------------------------------------------
     # q-based importance sampling estimate of log p_theta(x | s)
     # ------------------------------------------------------------------
 
@@ -614,12 +709,13 @@ class Struct2SeqLO(nn.Module):
 
         For each batch element b:
           1. Sample K permutations z^(k) ~ q_theta(z | x, s) via Plackett-Luce.
-          2. For each z^(k), run forward_p with permutation=z^(k) under teacher forcing
-             to obtain log p_theta(x | z^(k), s).
-          3. Compute log p_theta(z^(k) | s) and log q_theta(z^(k) | x, s) using the
-             Plackett-Luce log-probabilities.
-          4. Form importance weights w_k = p(z^(k) | s) / q(z^(k) | x, s) and use
-             log-sum-exp to approximate log p_theta(x | s).
+          2. For each z^(k), compute log p_theta(x | z^(k), s) and
+             log p_theta(z^(k) | s) by running L sequential forward_p calls
+             with partial autoregressive masks (one per decoding step).
+          3. Compute log q_theta(z^(k) | x, s) via the Plackett-Luce formula
+             (valid because q's logits are step-independent).
+          4. Form importance weights w_k = p(z^(k) | s) / q(z^(k) | x, s) and
+             use log-sum-exp to approximate log p_theta(x | s).
 
         Args:
             X: coordinates [B, N, 4, 3].
@@ -655,181 +751,15 @@ class Struct2SeqLO(nn.Module):
         for _ in range(K_eval):
             full_perm = gumbel_top_k(q_logits.detach())
 
-            log_probs_k, p_order_logits_k = self.forward_p(
-                h_V_enc,
-                h_E,
-                E_idx,
-                S,
-                mask,
-                permutation=full_perm,
+            log_p_z, log_p_x_given_z = self._compute_log_p_z_and_x_sequential(
+                h_V_enc, h_E, E_idx, S, mask, full_perm, L,
             )
-
-            log_p_token = torch.gather(
-                log_probs_k,
-                2,
-                S.unsqueeze(-1),
-            ).squeeze(-1)
-            log_p_x_given_z = (log_p_token * mask).sum(-1)
 
             log_q_all = plackett_luce_log_prob(q_logits, full_perm, mask)
             log_q_z = (log_q_all * mask).sum(-1)
 
-            log_p_all = plackett_luce_log_prob(p_order_logits_k, full_perm, mask)
-            log_p_z = (log_p_all * mask).sum(-1)
-
             log_weight = log_p_z - log_q_z
             log_terms.append(log_weight + log_p_x_given_z)
-
-        log_terms_stack = torch.stack(log_terms, dim=0)
-        log_p_x_given_s = torch.logsumexp(log_terms_stack, dim=0) - float(np.log(K_eval))
-
-        loglik_per_res = log_p_x_given_s / L_tensor
-        return loglik_per_res
-
-    # ------------------------------------------------------------------
-    # p_theta-only Monte Carlo estimate of log p_theta(x | s)
-    # ------------------------------------------------------------------
-
-    def compute_loglik_mc_p(
-        self,
-        X: torch.Tensor,
-        S: torch.Tensor,
-        L: np.ndarray,
-        mask: torch.Tensor,
-        num_samples_eval: int | None = None,
-    ) -> torch.Tensor:
-        """Estimate log p_theta(x | s) via Monte Carlo over orders from p_theta.
-
-        For each batch element b:
-          1. Sequentially sample a permutation z^(k) ~ p_theta(z | s) using the
-             p_theta order head with partial autoregressive masks:
-               - Start with no decoded positions.
-               - At each step i, build a partial AR mask corresponding to the
-                 current prefix z_{<i} via _build_partial_ar_mask.
-               - Run forward_p under teacher forcing to obtain order logits and
-                 sample the next position z_i among remaining positions.
-          2. After a full permutation is sampled, run forward_p once with the
-             full permutation to compute log p_theta(x | z^(k), s).
-          3. Average over K_eval such samples in log-space to approximate
-             log p_theta(x | s).
-
-        Args:
-            X: coordinates [B, N, 4, 3].
-            S: ground-truth sequence [B, N].
-            L: lengths array (np).
-            mask: padding mask [B, N].
-            num_samples_eval: number of Monte Carlo samples K_eval. If None,
-                a default value of 8 is used.
-
-        Returns:
-            loglik_per_res: [B] per-residue log-likelihood estimates
-                log p_theta(x | s) / L_b for each batch element.
-        """
-        B, N = S.shape
-        device = S.device
-
-        h_V_enc, h_E, E_idx, _ = self._encode(X, L, mask)
-
-        L_tensor = torch.tensor(L, dtype=torch.float32, device=device)
-
-        K_eval = num_samples_eval if num_samples_eval is not None else 8
-        if K_eval < 1:
-            raise ValueError("num_samples_eval must be >= 1.")
-
-        log_terms: list[torch.Tensor] = []
-
-        for _ in range(K_eval):
-            # Initialise decoded mask and permutation for this sample.
-            decoded_mask = torch.zeros(B, N, dtype=torch.float32, device=device)
-            full_perm = torch.arange(N, device=device).unsqueeze(0).expand(B, -1).clone()
-
-            while True:
-                any_active = False
-
-                for b in range(B):
-                    length_b = int(L[b])
-                    mask_b = mask[b]  # [N]
-
-                    # Remaining valid, undecoded positions for this batch element.
-                    remaining_mask_b = mask_b * (1.0 - decoded_mask[b])
-                    if remaining_mask_b.sum().item() == 0:
-                        continue
-
-                    any_active = True
-
-                    decoded_count_b = int((decoded_mask[b] * mask_b).sum().item())
-                    if decoded_count_b >= length_b:
-                        continue
-
-                    i_samples_b = torch.tensor(
-                        [min(decoded_count_b + 1, length_b)],
-                        dtype=torch.long,
-                        device=device,
-                    )
-
-                    # Build partial AR mask for this prefix using current permutation.
-                    ar_mask_b = self._build_partial_ar_mask(
-                        E_idx[b:b+1],
-                        full_perm[b:b+1],
-                        i_samples_b,
-                    )
-
-                    # Run forward_p for this single element to get order logits.
-                    log_probs_step_b, p_order_logits_step_b = self.forward_p(
-                        h_V_enc[b:b+1],
-                        h_E[b:b+1],
-                        E_idx[b:b+1],
-                        S[b:b+1],
-                        mask[b:b+1],
-                        ar_mask=ar_mask_b,
-                    )
-                    # Silence unused variable warning.
-                    _ = log_probs_step_b
-
-                    remaining_mask_b_2d = remaining_mask_b.unsqueeze(0)
-                    logits_step_b = p_order_logits_step_b.clone()
-                    logits_step_b = logits_step_b.masked_fill(
-                        remaining_mask_b_2d == 0,
-                        float('-inf'),
-                    )
-
-                    order_probs_b = F.softmax(logits_step_b, dim=-1)
-                    pos_b = torch.multinomial(order_probs_b, 1).squeeze(0).squeeze(-1)
-
-                    # Maintain consistency between permutation and decoded mask by
-                    # swapping the newly selected position into the next prefix slot.
-                    decoded_count_b_tensor = int(
-                        (decoded_mask[b] * mask_b).sum().item(),
-                    )
-                    perm_b = full_perm[b]
-                    idx_in_perm = (perm_b == pos_b).nonzero(as_tuple=False)[0, 0]
-
-                    full_perm[b, idx_in_perm] = perm_b[decoded_count_b_tensor]
-                    full_perm[b, decoded_count_b_tensor] = pos_b
-
-                    decoded_mask[b, pos_b] = 1.0
-
-                if not any_active:
-                    break
-
-            # Full permutation for this Monte Carlo sample; compute log p(x | z, s).
-            log_probs_k, _ = self.forward_p(
-                h_V_enc,
-                h_E,
-                E_idx,
-                S,
-                mask,
-                permutation=full_perm,
-            )
-
-            log_p_token = torch.gather(
-                log_probs_k,
-                2,
-                S.unsqueeze(-1),
-            ).squeeze(-1)
-            log_p_x_given_z = (log_p_token * mask).sum(-1)
-
-            log_terms.append(log_p_x_given_z)
 
         log_terms_stack = torch.stack(log_terms, dim=0)
         log_p_x_given_s = torch.logsumexp(log_terms_stack, dim=0) - float(np.log(K_eval))
