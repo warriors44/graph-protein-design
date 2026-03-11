@@ -514,9 +514,10 @@ class Struct2SeqLO(nn.Module):
         q_logits = self.forward_q(h_V_enc_q, h_E, E_idx, S, mask)
 
         L_tensor = torch.tensor(L, dtype=torch.float, device=device)
+        valid_L = mask.sum(-1)
 
         i_samples = (
-            torch.rand(B, device=device) * L_tensor
+            torch.rand(B, device=device) * valid_L
         ).long() + 1
 
         F_values: list[torch.Tensor] = []
@@ -625,6 +626,10 @@ class Struct2SeqLO(nn.Module):
         would yield, so we accumulate log p(x|z,s) here too and avoid an
         extra forward pass.
 
+        Note: some positions within 0..L-1 may have mask=0 (e.g. residues
+        with missing coordinates).  gumbel_top_k ranks mask=1 positions first,
+        so we loop over valid_L = mask.sum(-1) steps rather than L.
+
         Args:
             h_V_enc: encoder output [B, N, H].
             h_E: edge embeddings [B, N, K, H].
@@ -641,8 +646,8 @@ class Struct2SeqLO(nn.Module):
         B, N = S.shape
         device = S.device
 
-        L_long = torch.tensor(L, dtype=torch.long, device=device)
-        max_L = int(L_long.max().item())
+        valid_L = mask.sum(-1).long()
+        max_L = int(valid_L.max().item())
 
         rank = torch.zeros(B, N, dtype=torch.long, device=device)
         rank.scatter_(
@@ -657,14 +662,14 @@ class Struct2SeqLO(nn.Module):
         neg_inf = float('-inf')
 
         for step in range(1, max_L + 1):
-            active = L_long >= step  # [B]
+            active = valid_L >= step  # [B]
             if not active.any():
                 break
 
             i_samples = torch.full(
                 (B,), step, dtype=torch.long, device=device,
             )
-            i_samples = torch.min(i_samples, L_long)
+            i_samples = torch.min(i_samples, valid_L)
 
             ar_mask = self._build_partial_ar_mask(E_idx, full_perm, i_samples)
 
@@ -756,7 +761,7 @@ class Struct2SeqLO(nn.Module):
             )
 
             log_q_all = plackett_luce_log_prob(q_logits, full_perm, mask)
-            log_q_z = (log_q_all * mask).sum(-1)
+            log_q_z = log_q_all.sum(-1)
 
             log_weight = log_p_z - log_q_z
             log_terms.append(log_weight + log_p_x_given_z)
@@ -812,7 +817,8 @@ class Struct2SeqLO(nn.Module):
         if K_eval < 1:
             raise ValueError("num_samples_eval must be >= 1.")
 
-        max_steps = int(L_tensor.max().item())
+        valid_L = mask.sum(-1).long()
+        max_steps = int(valid_L.max().item())
 
         log_terms: list[torch.Tensor] = []
 
@@ -843,7 +849,7 @@ class Struct2SeqLO(nn.Module):
                 decoded_count = decoded_mask.sum(dim=1).long()
                 i_samples = torch.clamp(
                     decoded_count + 1,
-                    max=L_tensor.long(),
+                    max=valid_L,
                 )
 
                 ar_mask = self._build_partial_ar_mask(E_idx, full_perm, i_samples)
