@@ -599,6 +599,50 @@ class Struct2SeqLO(nn.Module):
         }
         return loss, info
 
+    def compute_elbo_rloo(
+        self,
+        X: torch.Tensor,
+        S: torch.Tensor,
+        L: np.ndarray,
+        mask: torch.Tensor,
+        num_samples: int | None = None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Backward-compatible alias for the paper-faithful RLOO ELBO.
+
+        The project previously exposed `compute_elbo_rloo` with an optional
+        `num_samples` argument. The current implementation uses
+        `compute_elbo_paper` and stores K in `self.num_samples`.
+
+        Args:
+            X: coordinates [B, N, 4, 3].
+            S: ground-truth sequence [B, N].
+            L: lengths array (np).
+            mask: padding mask [B, N].
+            num_samples: optional temporary K override for this call.
+
+        Returns:
+            loss: scalar loss to minimise.
+            info: monitoring dict including legacy keys expected by old tests.
+        """
+        old_num_samples = self.num_samples
+        if num_samples is not None:
+            if num_samples < 2:
+                raise ValueError("num_samples must be >= 2 for RLOO estimator.")
+            self.num_samples = num_samples
+
+        try:
+            loss, info = self.compute_elbo_paper(X, S, L, mask)
+        finally:
+            self.num_samples = old_num_samples
+
+        # Legacy monitoring keys kept for backwards compatibility.
+        # These are diagnostic surrogates for older logging code.
+        info_with_legacy = dict(info)
+        info_with_legacy["reinforce_var"] = info["delta_F_abs"]
+        info_with_legacy["loss_p"] = -info["F_mean"]
+        info_with_legacy["loss_reinforce"] = loss.detach() - info_with_legacy["loss_p"]
+        return loss, info_with_legacy
+
     # ------------------------------------------------------------------
     # Sequential computation of log p(z|s) and log p(x|z,s)
     # ------------------------------------------------------------------
@@ -697,6 +741,71 @@ class Struct2SeqLO(nn.Module):
             )
 
         return log_p_z, log_p_x_given_z
+
+    # ------------------------------------------------------------------
+    # q-sampled proxy estimate of log p_theta(x | s)
+    # ------------------------------------------------------------------
+
+    def compute_loglik_proxy_q_px(
+        self,
+        X: torch.Tensor,
+        S: torch.Tensor,
+        L: np.ndarray,
+        mask: torch.Tensor,
+        num_samples_eval: int | None = None,
+    ) -> torch.Tensor:
+        """Estimate log p_theta(x | s) with q-sampled orders and p(x|z,s) only.
+
+        This is a lightweight proxy metric for frequent validation:
+          1. Sample K permutations z^(k) ~ q_theta(z | x, s).
+          2. For each z^(k), run one forward_p(permutation=z^(k)) call.
+          3. Aggregate log p_theta(x | z^(k), s) with log-sum-exp.
+
+        Unlike compute_loglik_is_q, this method does NOT include importance
+        weights p_theta(z|s) / q_theta(z|x,s), so it is faster but biased.
+
+        Args:
+            X: coordinates [B, N, 4, 3].
+            S: ground-truth sequence [B, N].
+            L: lengths array (np).
+            mask: padding mask [B, N].
+            num_samples_eval: number of q samples K. If None, defaults to 8.
+
+        Returns:
+            loglik_per_res: [B] proxy per-residue log-likelihood estimates
+                log p_theta(x | s) / L_b for each batch element.
+        """
+        device = S.device
+
+        h_V_enc, h_E, E_idx, _ = self._encode(X, L, mask)
+
+        if self.separate_encoder:
+            h_V_enc_q, _, _, _ = self._encode_q(X, L, mask)
+        else:
+            h_V_enc_q = h_V_enc
+        q_logits = self.forward_q(h_V_enc_q, h_E, E_idx, S, mask)
+
+        L_tensor = torch.tensor(L, dtype=torch.float32, device=device)
+        K_eval = num_samples_eval if num_samples_eval is not None else 8
+        if K_eval < 1:
+            raise ValueError("num_samples_eval must be >= 1.")
+
+        log_terms: list[torch.Tensor] = []
+        for _ in range(K_eval):
+            full_perm = gumbel_top_k(q_logits.detach())
+            log_probs_k, _ = self.forward_p(
+                h_V_enc, h_E, E_idx, S, mask, permutation=full_perm,
+            )
+            log_p_token = torch.gather(
+                log_probs_k, 2, S.unsqueeze(-1),
+            ).squeeze(-1)
+            log_p_x_given_z = (log_p_token * mask).sum(-1)
+            log_terms.append(log_p_x_given_z)
+
+        log_terms_stack = torch.stack(log_terms, dim=0)
+        log_p_x_given_s = torch.logsumexp(log_terms_stack, dim=0) - float(np.log(K_eval))
+        loglik_per_res = log_p_x_given_s / L_tensor
+        return loglik_per_res
 
     # ------------------------------------------------------------------
     # q-based importance sampling estimate of log p_theta(x | s)

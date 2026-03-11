@@ -101,6 +101,21 @@ def get_args():
         help='Number of importance samples (K_eval) for q-based evaluation',
     )
     parser.add_argument(
+        '--proxy_num_samples',
+        type=int,
+        default=8,
+        help='Number of q-order samples for lightweight proxy validation',
+    )
+    parser.add_argument(
+        '--eval_full_interval',
+        type=int,
+        default=20,
+        help=(
+            'Run full IS-q validation every i epochs (and always at epoch 1), '
+            'where i is this interval'
+        ),
+    )
+    parser.add_argument(
         '--order_mode',
         type=str,
         default='fix_order',
