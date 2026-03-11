@@ -12,7 +12,7 @@ from torch.utils.data.dataset import random_split, Subset
 
 # Library code
 sys.path.insert(0, '..')
-from struct2seq import struct2seq, seq_model, struct2seq_lo
+from struct2seq import struct2seq, seq_model, struct2seq_lo, struct2seq_ao
 
 from argparse import ArgumentParser
 
@@ -100,6 +100,17 @@ def get_args():
         default=8,
         help='Number of importance samples (K_eval) for q-based evaluation',
     )
+    parser.add_argument(
+        '--order_mode',
+        type=str,
+        default='fix_order',
+        choices=['fix_order', 'any_order', 'learning_order'],
+        help=(
+            'Decoding order mode for redesign sampling scripts. '
+            "AO supports: fix_order, any_order. "
+            "LO supports: learning_order, fix_order, any_order."
+        ),
+    )
     args = parser.parse_args()
 
     # ------------------------------------------------------------------
@@ -159,6 +170,18 @@ def setup_model(hyperparams, device):
             encoder_arch=hyperparams['p_encoder_arch'],
             decoder_arch=hyperparams['p_decoder_arch'],
         ).to(device)
+    elif hyperparams['model_type'] == 'structure_ao':
+        model = struct2seq_ao.Struct2SeqAO(
+            num_letters=hyperparams['vocab_size'],
+            node_features=hyperparams['hidden'],
+            edge_features=hyperparams['hidden'],
+            hidden_dim=hyperparams['hidden'],
+            k_neighbors=hyperparams['k_neighbors'],
+            protein_features=hyperparams['features'],
+            dropout=hyperparams['dropout'],
+            encoder_arch=hyperparams['p_encoder_arch'],
+            decoder_arch=hyperparams['p_decoder_arch'],
+        ).to(device)
     elif hyperparams['model_type'] == 'sequence':
         model = seq_model.SequenceModel(
             num_letters=hyperparams['vocab_size'],
@@ -193,6 +216,11 @@ def setup_model(hyperparams, device):
             f"Struct2Seq: encoder={model.encoder_arch}, "
             f"decoder={model.decoder_arch}",
         )
+    elif isinstance(model, struct2seq_ao.Struct2SeqAO):
+        print(
+            f"Struct2SeqAO: encoder={model.encoder_arch}, "
+            f"decoder={model.decoder_arch}",
+        )
     elif isinstance(model, struct2seq_lo.Struct2SeqLO):
         print(
             "Struct2SeqLO: "
@@ -211,7 +239,7 @@ def setup_cli_model():
     args = get_args()
     device = setup_device_rng(args)
     model = setup_model(vars(args), device)
-    if args.restore is not '':
+    if args.restore != '':
         load_checkpoint(args.restore, model)
     return args, device, model
 
