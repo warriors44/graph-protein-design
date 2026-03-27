@@ -1119,12 +1119,11 @@ class Struct2SeqLO(nn.Module):
                     h_S[b:b+1], h_E_p, E_idx_p,
                 )
 
-                ar_mask_p = decoded_mask[b:b+1].unsqueeze(0)
                 neighbor_decoded = torch.gather(
-                    decoded_mask[b:b+1].unsqueeze(1).expand(-1, 1, E_idx_p.size(-1)),
-                    -1,
-                    E_idx_p[:, 0:1, :].squeeze(1).unsqueeze(0),
-                ).unsqueeze(-1)
+                    decoded_mask[b:b+1],  # [1, N_nodes]
+                    1,
+                    E_idx_p.squeeze(1),   # [1, K]
+                ).unsqueeze(1).unsqueeze(-1)  # [1, 1, K, 1]
                 mask_bw_p = neighbor_decoded
                 mask_fw_p = 1.0 - neighbor_decoded
 
