@@ -43,9 +43,9 @@ import torch.nn.functional as F
 
 # Library code
 sys.path.insert(0, "..")
-from struct2seq import data
+from struct2seq import data, struct2seq_ao
 
-from utils import featurize, setup_cli_model
+from utils import featurize, get_args, load_checkpoint, setup_device_rng
 
 try:
     import pandas as pd  # type: ignore
@@ -171,13 +171,36 @@ def _similarity(seq1: str, seq2: str) -> float:
 
 
 def main() -> None:
-    args, device, model = setup_cli_model()
+    args = get_args()
 
     if args.model_type != "structure_ao":
         raise ValueError(
             "test_redesign_ao.py requires --model_type structure_ao, "
             f"got {args.model_type!r}.",
         )
+    if args.restore == "":
+        raise ValueError("test_redesign_ao.py requires --restore <checkpoint.pt>.")
+
+    device = setup_device_rng(args)
+
+    model = struct2seq_ao.Struct2SeqAO(
+        num_letters=args.vocab_size,
+        node_features=args.hidden,
+        edge_features=args.hidden,
+        hidden_dim=args.hidden,
+        k_neighbors=args.k_neighbors,
+        protein_features=args.features,
+        dropout=args.dropout,
+        encoder_arch=args.p_encoder_arch,
+        decoder_arch=args.p_decoder_arch,
+    ).to(device)
+    print(
+        "Number of parameters: {}".format(
+            sum(p.numel() for p in model.parameters()),
+        ),
+    )
+
+    load_checkpoint(args.restore, model)
 
     # Local CLI extension (keeps experiments/utils.py stable)
     if not hasattr(args, "order_mode"):

@@ -1,215 +1,218 @@
-from __future__ import print_function
-import json, time, os, sys, glob, copy
+from __future__ import annotations
+
+import copy
+import json
+import os
+import sys
+import time
+from typing import Any
 
 import numpy as np
 import torch
-from torch import optim
-from torch.utils.data import DataLoader
-from torch.utils.data.dataset import random_split, Subset
-import random
+import torch.nn.functional as F
 
 ## Library code
-sys.path.insert(0, '..')
-from struct2seq import *
-
-# Debug plotting
-import matplotlib
-import glob
-import pandas as pd
+sys.path.insert(0, "..")
+from struct2seq import data, struct2seq  # type: ignore
 
 from matplotlib import pyplot as plt
-plt.switch_backend('agg')
+import pandas as pd  # type: ignore
 
-from utils import *
-
-# Simulate extra arguments
-# sys.argv = [
-#     sys.argv[0], '--features', 'full',
-#     '--restore', 'log/h128_full_ollikainen/epoch48_step22896.pt',
-#     '--file_data', '../data/ollikainen/ollikainen_set.jsonl',
-#     '--file_splits', '../data/ollikainen/ollikainen_benchmark.json'
-# ]
-# --cuda --features full --restore log/h128_full_ollikainen/epoch48_step22896.pt --file_data ../data/ollikainen/ollikainen_set.jsonl --file_splits ../data/ollikainen/ollikainen_benchmark.json
-
-args, device, model = setup_cli_model()
-criterion = torch.nn.NLLLoss(reduction='none')
-
-# Load the test set from a splits file
-with open(args.file_splits) as f:
-    dataset_splits = json.load(f)
-test_names = dataset_splits['test']
-# Load the dataset
-dataset = data.StructureDataset(args.file_data, truncate=None, max_length=500)
-# Split the dataset
-dataset_indices = {d['name']:i for i,d in enumerate(dataset)}
-test_set = Subset(dataset, [dataset_indices[name] for name in test_names])
-loader_test = data.StructureLoader(test_set, batch_size=args.batch_tokens)
-print('Testing {} domains'.format(len(test_set)))
+from utils import featurize, get_args, load_checkpoint, setup_device_rng
 
 
-def _plot_log_probs(log_probs, total_step):
-    alphabet = 'ACDEFGHIKLMNPQRSTVWY'
-    reorder = 'DEKRHQNSTPGAVILMCFWY'
-    permute_ix = np.array([alphabet.index(c) for c in reorder])
-    plt.close()
-    fig = plt.figure(figsize=(8,3))
-    ax = fig.add_subplot(111)
-    P = np.exp(log_probs.cpu().data.numpy())[0].T
-    plt.imshow(P[permute_ix])
-    plt.clim(0,1)
-    plt.colorbar()
-    plt.yticks(np.arange(20), [a for a in reorder])
-    ax.tick_params(axis=u'both', which=u'both',length=0, labelsize=5)
-    plt.tight_layout()
-    plt.savefig(base_folder + 'probs{}.pdf'.format(total_step))
-    return
-
-def _loss(S, log_probs, mask):
-    """ Negative log probabilities """
+def _scores(
+    S: torch.Tensor,
+    log_probs: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    """Per-protein average negative log-likelihood."""
+    criterion = torch.nn.NLLLoss(reduction="none")
     loss = criterion(
-        log_probs.contiguous().view(-1,log_probs.size(-1)),
-        S.contiguous().view(-1)
-    ).view(S.size())
-    loss_av = torch.sum(loss * mask) / torch.sum(mask)
-    return loss, loss_av
-
-
-def _scores(S, log_probs, mask):
-    """ Negative log probabilities """
-    loss = criterion(
-        log_probs.contiguous().view(-1,log_probs.size(-1)),
-        S.contiguous().view(-1)
+        log_probs.contiguous().view(-1, log_probs.size(-1)),
+        S.contiguous().view(-1),
     ).view(S.size())
     scores = torch.sum(loss * mask, dim=-1) / torch.sum(mask, dim=-1)
     return scores
 
-def _S_to_seq(S, mask):
-    alphabet = 'ACDEFGHIKLMNPQRSTVWY'
-    seq = ''.join([alphabet[c] for c, m in zip(S.tolist(), mask.tolist()) if m > 0])
-    return seq
+def _S_to_seq(S: torch.Tensor, mask: torch.Tensor) -> str:
+    alphabet = "ACDEFGHIKLMNPQRSTVWY"
+    return "".join(
+        alphabet[int(c)]
+        for c, m in zip(S.tolist(), mask.tolist())
+        if float(m) > 0
+    )
 
 
-# Build paths for experiment
-base_folder = time.strftime("test/%y%b%d_%I%M%p/", time.localtime())
-if not os.path.exists(base_folder):
-    os.makedirs(base_folder)
-for subfolder in ['alignments']:
-    if not os.path.exists(base_folder + subfolder):
-        os.makedirs(base_folder + subfolder)
-logfile = base_folder + '/log.txt'
-with open(base_folder + '/hyperparams.json', 'w') as f:
-    json.dump(vars(args), f)
+def similarity(seq1: str, seq2: str) -> float:
+    matches = sum(c1 == c2 for c1, c2 in zip(seq1, seq2))
+    return float(matches) / float(len(seq1))
 
 
-BATCH_COPIES = 50
-NUM_BATCHES = 1
-# temperatures = [1.0, 0.33, 0.1, 0.033, 0.01]
-temperatures = [0.1] * 2
+def main() -> None:
+    args = get_args()
 
-# Timing
-start_time = time.time()
-total_residues = 0
+    if args.model_type != "structure":
+        raise ValueError(
+            "test_redesign.py requires --model_type structure, "
+            f"got {args.model_type!r}.",
+        )
+    if args.restore == "":
+        raise ValueError("test_redesign.py requires --restore <checkpoint.pt>.")
 
-total_step = 0
-# Validation epoch
-model.eval()
-with torch.no_grad():
-    test_sum, test_weights = 0., 0.
-    for ix, protein in enumerate(test_set):
-        
-        batch_clones = [copy.deepcopy(protein) for i in range(BATCH_COPIES)]
-        X, S, mask, lengths = featurize(batch_clones, device)
+    device = setup_device_rng(args)
 
-        log_probs = model(X, S, lengths, mask)
-        scores = _scores(S, log_probs, mask)
-        native_score = scores.cpu().data.numpy()[0]
-        print(scores)
+    model = struct2seq.Struct2Seq(
+        num_letters=args.vocab_size,
+        node_features=args.hidden,
+        edge_features=args.hidden,
+        hidden_dim=args.hidden,
+        k_neighbors=args.k_neighbors,
+        protein_features=args.features,
+        dropout=args.dropout,
+        encoder_arch=args.p_encoder_arch,
+        decoder_arch=args.p_decoder_arch,
+    ).to(device)
+    print(
+        "Number of parameters: {}".format(
+            sum(p.numel() for p in model.parameters()),
+        ),
+    )
 
-        # Generate some sequences
-        ali_file = base_folder + 'alignments/' + batch_clones[0]['name'] + '.fa'
-        
-        with open(ali_file, 'w') as f:
-            native_seq = _S_to_seq(S[0], mask[0])
-            f.write('>Native, score={}\n{}\n'.format(native_score, native_seq))
-            for temp in temperatures:
-                for j in range(NUM_BATCHES):
-                    S_sample = model.sample(X, lengths, mask, temperature=temp)
+    load_checkpoint(args.restore, model)
 
-                    # Compute scores
-                    log_probs = model(X, S_sample, lengths, mask)
-                    scores = _scores(S_sample, log_probs, mask)
-                    scores = scores.cpu().data.numpy()
+    # Load the test set from a splits file
+    with open(args.file_splits) as f:
+        dataset_splits = json.load(f)
+    test_names: list[str] = dataset_splits["test"]
 
-                    for b_ix in range(BATCH_COPIES):
-                        seq = _S_to_seq(S_sample[b_ix], mask[0])
-                        score = scores[b_ix]
-                        f.write('>T={}, sample={}, score={}\n{}\n'.format(temp,b_ix,score,seq))
+    # Load the dataset
+    dataset = data.StructureDataset(args.file_data, truncate=None, max_length=500)
+    dataset_indices = {d["name"]: i for i, d in enumerate(dataset)}
+    test_set = torch.utils.data.Subset(
+        dataset,
+        [dataset_indices[name] for name in test_names],
+    )
+    print("Testing {} domains".format(len(test_set)))
 
-                    total_residues += torch.sum(mask).cpu().data.numpy()
-                    elapsed = time.time() - start_time
-                    residues_per_second = float(total_residues) / float(elapsed)
-                    print('{} residues / s'.format(residues_per_second))
+    # Build paths for experiment
+    if args.name != "":
+        base_folder = "log/" + args.name + "/"
+    else:
+        base_folder = time.strftime("test/%y%b%d_%I%M%p/", time.localtime())
 
-                frac_recovery = torch.sum(mask * (S.eq(S_sample).float())) / torch.sum(mask)
-                frac_recovery = frac_recovery.cpu().data.numpy()
-                # print(mask)
-                # print(frac_recovery, torch.numel(mask), torch.sum(mask).cpu().data.numpy(), batch_clones[0]['name'])
-                print(frac_recovery)
+    os.makedirs(base_folder, exist_ok=True)
+    os.makedirs(base_folder + "alignments", exist_ok=True)
+    with open(base_folder + "/hyperparams.json", "w") as f:
+        json.dump(vars(args), f)
 
-# Plot the results
-files = glob.glob(base_folder + 'alignments/*.fa')
-df = pd.DataFrame(columns=['name', 'T', 'score', 'similarity'])
+    BATCH_COPIES = 50
+    NUM_BATCHES = 1
+    temperatures: list[float] = [0.1] * 2
 
-def similarity(seq1, seq2):
-    matches = sum([c1==c2 for c1, c2 in zip(seq1,seq2)])
-    return float(matches) / len(seq1)
+    # Timing
+    start_time = time.time()
+    total_residues = 0.0
 
-for file in files:
-    with open(file, 'r') as f:
-        # Skip over native
-        entries = f.read().split('>')[1:]
-        entries = [e.strip().split('\n') for e in entries]
+    model.eval()
+    with torch.no_grad():
+        for ix, protein in enumerate(test_set):
+            batch_clones = [copy.deepcopy(protein) for _ in range(BATCH_COPIES)]
+            X, S_native, mask, lengths = featurize(batch_clones, device)
 
-        # Get native information
-        native_header = entries[0][0]
-        native_score = float(native_header.split(', ')[1].split('=')[1])
-        native_seq = entries[0][1]
-        print(entries[0])
-        print(native_score)
-
-        for header, seq in entries[1:]:
-            T, sample, score = [float(s.split('=')[1]) for s in header.split(', ')]
-            pdb, chain = file.split('/')[-1].split('.')[0:2]
-
-            df = df.append({
-                'name': pdb + '.' + chain,
-                'T': T, 'score': score,
-                'native': native_score,
-                'similarity': similarity(native_seq, seq)
-                },  ignore_index=True
+            log_probs_native = model(X, S_native, lengths, mask)
+            native_score = float(
+                _scores(S_native, log_probs_native, mask).cpu().numpy()[0],
             )
 
-df['diff'] = -(df['score'] - df['native'])
+            ali_file = base_folder + "alignments/" + batch_clones[0]["name"] + ".fa"
+            with open(ali_file, "w") as f:
+                native_seq = _S_to_seq(S_native[0], mask[0])
+                f.write(f">Native, score={native_score}\n{native_seq}\n")
 
-boxplot = df.boxplot(column='diff', by= 'T')
-plt.xlabel('Decoding temperature')
-plt.ylabel('log P(sample) - log P(native)')
-boxplot.get_figure().gca().set_title('')
-boxplot.get_figure().suptitle('')
-plt.tight_layout()
-plt.savefig(base_folder + 'decoding.pdf')
+                for temp in temperatures:
+                    for _ in range(NUM_BATCHES):
+                        S_sample = model.sample(X, lengths, mask, temperature=float(temp))
 
-boxplot = df.boxplot(column='similarity', by= 'T')
-plt.xlabel('Decoding temperature')
-plt.ylabel('Native sequence recovery')
-boxplot.get_figure().gca().set_title('')
-boxplot.get_figure().suptitle('')
-plt.tight_layout()
-plt.savefig(base_folder + 'recovery.pdf')
+                        log_probs_sample = model(X, S_sample, lengths, mask)
+                        scores = _scores(S_sample, log_probs_sample, mask).cpu().numpy()
 
-# Store the results
-df_mean = df.groupby(['name', 'T'], as_index=False).mean()
-df_mean.to_csv(base_folder + 'results.csv')
+                        for b_ix in range(BATCH_COPIES):
+                            seq = _S_to_seq(S_sample[b_ix], mask[0])
+                            score = float(scores[b_ix])
+                            f.write(
+                                f">T={float(temp)}, sample={float(b_ix)}, score={score}\n{seq}\n",
+                            )
 
-print('Speed total: {} residues / s'.format(residues_per_second))
-print('Median', df_mean['similarity'].median())
+                        total_residues += float(torch.sum(mask).cpu().numpy())
+                        elapsed = time.time() - start_time
+                        residues_per_second = float(total_residues) / float(
+                            max(elapsed, 1e-8),
+                        )
+                        print(f"{residues_per_second} residues / s")
+
+                    frac_recovery = torch.sum(
+                        mask * (S_native.eq(S_sample).float()),
+                    ) / torch.sum(mask)
+                    print(float(frac_recovery.cpu().numpy()))
+
+    # Plot the results
+    files = [
+        os.path.join(base_folder, "alignments", f)
+        for f in os.listdir(base_folder + "alignments")
+        if f.endswith(".fa")
+    ]
+    rows: list[dict[str, Any]] = []
+
+    for file in files:
+        with open(file, "r") as f:
+            entries = f.read().split(">")[1:]
+            entries = [e.strip().split("\n") for e in entries]
+
+        native_header = entries[0][0]
+        native_score = float(native_header.split(", ")[1].split("=")[1])
+        native_seq = entries[0][1]
+
+        for header, seq in entries[1:]:
+            T, sample, score = [float(s.split("=")[1]) for s in header.split(", ")]
+            pdb, chain = os.path.basename(file).split(".")[0:2]
+            rows.append(
+                {
+                    "name": pdb + "." + chain,
+                    "T": T,
+                    "score": score,
+                    "native": native_score,
+                    "similarity": similarity(native_seq, seq),
+                },
+            )
+
+    df = pd.DataFrame(rows, columns=["name", "T", "score", "similarity", "native"])
+    df["diff"] = -(df["score"] - df["native"])
+
+    plt.switch_backend("agg")
+
+    boxplot = df.boxplot(column="diff", by="T")
+    plt.xlabel("Decoding temperature")
+    plt.ylabel("log P(sample) - log P(native)")
+    boxplot.get_figure().gca().set_title("")
+    boxplot.get_figure().suptitle("")
+    plt.tight_layout()
+    plt.savefig(base_folder + "decoding.pdf")
+
+    boxplot = df.boxplot(column="similarity", by="T")
+    plt.xlabel("Decoding temperature")
+    plt.ylabel("Native sequence recovery")
+    boxplot.get_figure().gca().set_title("")
+    boxplot.get_figure().suptitle("")
+    plt.tight_layout()
+    plt.savefig(base_folder + "recovery.pdf")
+
+    df_mean = df.groupby(["name", "T"], as_index=False).mean()
+    df_mean.to_csv(base_folder + "results.csv")
+
+    print(f"Speed total: {residues_per_second} residues / s")
+    print("Median", df_mean["similarity"].median())
+
+
+if __name__ == "__main__":
+    main()
