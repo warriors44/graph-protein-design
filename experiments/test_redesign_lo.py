@@ -267,9 +267,9 @@ def main() -> None:
     test_set = torch.utils.data.Subset(dataset, [dataset_indices[name] for name in test_names])
     print("Testing {} domains".format(len(test_set)))
 
-    # Output folders
+    order_prefix="lo" if order_cfg.mode == "learning_order" else "fo" if order_cfg.mode == "fix_order" else "ao"
     if args.name != '':
-        base_folder = 'log/' + args.name + '/'
+        base_folder = 'log/' + args.name + '/' + order_prefix + '/'
     else:
         base_folder = time.strftime("test/%y%b%d_%I%M%p/", time.localtime())
         
