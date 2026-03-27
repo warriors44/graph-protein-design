@@ -44,9 +44,9 @@ import torch.nn.functional as F
 
 # Library code
 sys.path.insert(0, "..")
-from struct2seq import data
+from struct2seq import data, struct2seq_lo
 
-from utils import featurize, setup_cli_model
+from utils import featurize, get_args, load_checkpoint, setup_device_rng
 
 try:
     import pandas as pd  # type: ignore
@@ -203,13 +203,43 @@ def _similarity(seq1: str, seq2: str) -> float:
 
 
 def main() -> None:
-    args, device, model = setup_cli_model()
+    args = get_args()
 
     if args.model_type != "structure_lo":
         raise ValueError(
             "test_redesign_lo.py requires --model_type structure_lo, "
             f"got {args.model_type!r}.",
         )
+    if args.restore == "":
+        raise ValueError(
+            "test_redesign_lo.py requires --restore <checkpoint.pt>.",
+        )
+
+    device = setup_device_rng(args)
+
+    model = struct2seq_lo.Struct2SeqLO(
+        num_letters=args.vocab_size,
+        node_features=args.hidden,
+        edge_features=args.hidden,
+        hidden_dim=args.hidden,
+        k_neighbors=args.k_neighbors,
+        protein_features=args.features,
+        dropout=args.dropout,
+        num_samples=args.num_samples,
+        p_encoder_arch=args.p_encoder_arch,
+        p_decoder_arch=args.p_decoder_arch,
+        q_encoder_arch=args.q_encoder_arch,
+        q_decoder_arch=args.q_decoder_arch,
+        separate_encoder=args.separate_encoder,
+        separate_decoder=args.separate_decoder,
+    ).to(device)
+    print(
+        "Number of parameters: {}".format(
+            sum(p.numel() for p in model.parameters()),
+        ),
+    )
+
+    load_checkpoint(args.restore, model)
 
     order_mode = getattr(args, "order_mode", "learning_order")
     if order_mode not in ("learning_order", "fix_order", "any_order"):
@@ -228,7 +258,11 @@ def main() -> None:
     print("Testing {} domains".format(len(test_set)))
 
     # Output folders
-    base_folder = time.strftime("test/%y%b%d_%I%M%p/", time.localtime())
+    if args.name != '':
+        base_folder = 'log/' + args.name + '/'
+    else:
+        base_folder = time.strftime("test/%y%b%d_%I%M%p/", time.localtime())
+        
     os.makedirs(base_folder, exist_ok=True)
     os.makedirs(base_folder + "alignments", exist_ok=True)
     with open(base_folder + "/hyperparams.json", "w") as f:
