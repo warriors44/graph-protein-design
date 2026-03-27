@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from typing import Any
 
 import numpy as np
@@ -16,6 +17,7 @@ from utils import featurize, get_args, load_checkpoint, setup_device_rng
 
 
 def main() -> None:
+    start_time = time.time()
     args = get_args()
 
     if args.model_type != "structure_lo":
@@ -97,6 +99,9 @@ def main() -> None:
         base_folder = time.strftime('log/lo_%y%b%d_%I%M%p/', time.localtime())
     with open(base_folder + 'test.txt', 'w') as f:
         f.write('Perplexity\tTest ISQ:{}\n'.format(test_ppl_isq))
+
+    elapsed = time.time() - start_time
+    print(f"Time taken: {elapsed} seconds")
 
 if __name__ == "__main__":
     main()
