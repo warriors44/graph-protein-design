@@ -96,6 +96,50 @@ def test_basic() -> None:
         print(f"  p_grad_norm = {p_norm:.6f}")
 
 
+def test_entropy_bonus_keys_and_loss_consistency() -> None:
+    """Entropy bonus: info keys and loss = elbo_no_penalty - lambda * entropy_q."""
+    torch.manual_seed(42)
+    device = torch.device("cpu")
+    model = Struct2SeqLO(
+        num_letters=20,
+        node_features=64,
+        edge_features=64,
+        hidden_dim=64,
+        num_encoder_layers=1,
+        num_decoder_layers=1,
+        vocab=20,
+        k_neighbors=10,
+        dropout=0.0,
+        lambda_entropy=0.01,
+    ).to(device)
+    B, N = 2, 20
+    X = torch.randn(B, N, 4, 3, device=device)
+    S = torch.randint(0, 20, (B, N), device=device)
+    lengths = np.array([N, N - 3])
+    mask = torch.zeros(B, N, device=device)
+    for i, l in enumerate(lengths):
+        mask[i, :l] = 1.0
+
+    loss, info = model.compute_elbo_paper(X, S, lengths, mask)
+
+    assert "entropy_q" in info
+    assert "entropy_q_weighted" in info
+    assert "elbo_no_penalty" in info
+    assert torch.isfinite(info["entropy_q"])
+    assert torch.isfinite(info["entropy_q_weighted"])
+    assert torch.isfinite(info["elbo_no_penalty"])
+
+    expected = info["elbo_no_penalty"] - 0.01 * info["entropy_q"]
+    assert torch.allclose(loss.detach(), expected, rtol=1e-5, atol=1e-6)
+    assert torch.allclose(
+        info["entropy_q_weighted"],
+        0.01 * info["entropy_q"],
+        rtol=1e-5,
+        atol=1e-6,
+    )
+    print("test_entropy_bonus_keys_and_loss_consistency PASSED")
+
+
 def test_loglik_is_q_basic() -> None:
     """Basic sanity check for compute_loglik_is_q.
 
@@ -235,6 +279,7 @@ def test_edge_i_equals_L() -> None:
 
 if __name__ == '__main__':
     test_basic()
+    test_entropy_bonus_keys_and_loss_consistency()
     test_edge_i_equals_1()
     test_edge_i_equals_L()
     test_loglik_is_q_basic()

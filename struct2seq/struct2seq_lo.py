@@ -5,6 +5,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributions import Categorical
 
 from .self_attention import (
     TransformerLayer,
@@ -50,6 +51,7 @@ class Struct2SeqLO(nn.Module):
         q_decoder_arch: str = "transformer",
         separate_encoder: bool = False,
         separate_decoder: bool = False,
+        lambda_entropy: float = 0.0,
     ) -> None:
         super(Struct2SeqLO, self).__init__()
 
@@ -88,6 +90,7 @@ class Struct2SeqLO(nn.Module):
         self.q_decoder_arch = q_decoder_arch
         self.separate_encoder = separate_encoder
         self.separate_decoder = separate_decoder
+        self.lambda_entropy = float(lambda_entropy)
 
         # Featurization
         self.features = ProteinFeatures(
@@ -522,8 +525,11 @@ class Struct2SeqLO(nn.Module):
 
         F_values: list[torch.Tensor] = []
         log_q_values: list[torch.Tensor] = []
+        H_norm_values: list[torch.Tensor] = []
 
         K = self.num_samples
+
+        neg_inf = float("-inf")
 
         for _ in range(K):
             full_perm = gumbel_top_k(q_logits.detach())
@@ -542,6 +548,15 @@ class Struct2SeqLO(nn.Module):
                 rank < (i_samples - 1).unsqueeze(1)
             ).float()
             remaining_mask = (1.0 - decoded_mask) * mask
+
+            if self.lambda_entropy != 0.0:
+                q_logits_for_ent = q_logits.masked_fill(
+                    remaining_mask == 0, neg_inf,
+                )
+                H_k = Categorical(logits=q_logits_for_ent).entropy()
+                R_t = remaining_mask.sum(dim=-1).clamp(min=2.0)
+                H_norm_k = H_k / torch.log(R_t)
+                H_norm_values.append(H_norm_k)
 
             F_k = self._compute_F_theta(
                 log_probs_k, p_order_logits_k, q_logits, S, remaining_mask,
@@ -577,7 +592,15 @@ class Struct2SeqLO(nn.Module):
         rloo_term = (adv * log_q_stack).mean(dim=0)  # [B]
 
         loss_per_elem = -L_tensor * (F_mean + rloo_term)
-        loss = loss_per_elem.sum() / L_tensor.sum()
+        loss_raw = loss_per_elem.sum() / L_tensor.sum()
+
+        if self.lambda_entropy != 0.0 and H_norm_values:
+            H_stack = torch.stack(H_norm_values, dim=0)
+            H_normalized = H_stack.mean()
+            loss = loss_raw - self.lambda_entropy * H_normalized
+        else:
+            H_normalized = torch.tensor(0.0, device=device, dtype=loss_raw.dtype)
+            loss = loss_raw
 
         with torch.no_grad():
             elbo_per_res = F_mean.mean()
@@ -590,12 +613,23 @@ class Struct2SeqLO(nn.Module):
             ).squeeze(-1)
             nll_avg = -(log_p_token_all * mask).sum() / mask.sum()
 
+            if self.lambda_entropy != 0.0 and H_norm_values:
+                H_norm_det = H_normalized.detach()
+                entropy_q = H_norm_det
+                entropy_q_weighted = (self.lambda_entropy * H_norm_det)
+            else:
+                entropy_q = torch.tensor(0.0, device=device)
+                entropy_q_weighted = torch.tensor(0.0, device=device)
+
         info = {
             'elbo': elbo_per_res,
             'nll': nll_avg,
             'F_mean': F_mean.mean(),
             'delta_F_abs': delta_F_abs,
             'i_mean': i_samples.float().mean(),
+            'entropy_q': entropy_q,
+            'entropy_q_weighted': entropy_q_weighted,
+            'elbo_no_penalty': loss_raw.detach(),
         }
         return loss, info
 

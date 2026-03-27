@@ -85,6 +85,15 @@ def get_args():
         help='Number of RLOO samples (K) for LO-ARM ELBO',
     )
     parser.add_argument(
+        '--lambda_entropy',
+        type=float,
+        default=0.0,
+        help=(
+            'Entropy bonus coefficient for q order distribution (structure_lo only). '
+            'Loss -= lambda_entropy * H_normalized; 0 disables.'
+        ),
+    )
+    parser.add_argument(
         '--eval_mode',
         type=str,
         default='fixed',
@@ -224,6 +233,7 @@ def setup_model(hyperparams, device):
             q_decoder_arch=hyperparams['q_decoder_arch'],
             separate_encoder=hyperparams.get('separate_encoder', False),
             separate_decoder=hyperparams.get('separate_decoder', False),
+            lambda_entropy=hyperparams.get('lambda_entropy', 0.0),
         ).to(device)
 
     if isinstance(model, struct2seq.Struct2Seq):

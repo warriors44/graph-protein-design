@@ -48,6 +48,7 @@ def main() -> None:
         q_decoder_arch=args.q_decoder_arch,
         separate_encoder=args.separate_encoder,
         separate_decoder=args.separate_decoder,
+        lambda_entropy=args.lambda_entropy,
     ).to(device)
     print('Number of parameters: {}'.format(
         sum(p.numel() for p in model.parameters())
