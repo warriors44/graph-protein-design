@@ -248,6 +248,16 @@ def main() -> None:
         )
     order_cfg = OrderConfig(mode=str(order_mode))
 
+    order_prefix="lo" if order_cfg.mode == "learning_order" else "fo" if order_cfg.mode == "fix_order" else "ao"
+    if args.name != '':
+        base_folder = 'log/' + args.name + '/' + order_prefix + '/'
+    else:
+        base_folder = time.strftime("test/%y%b%d_%I%M%p/", time.localtime())
+        
+    os.makedirs(base_folder, exist_ok=True)
+    os.makedirs(base_folder + "alignments", exist_ok=True)
+    with open(base_folder + "/hyperparams.json", "w") as f:
+        json.dump(vars(args), f)
     # Load test set
     with open(args.file_splits) as f:
         dataset_splits = json.load(f)
@@ -337,7 +347,7 @@ def main() -> None:
         return
 
     files = [os.path.join(base_folder, "alignments", f) for f in os.listdir(base_folder + "alignments") if f.endswith(".fa")]
-    df = pd.DataFrame(columns=["name", "T", "score", "similarity", "native"])
+    rows: list[dict[str, object]] = []
 
     for file in files:
         with open(file, "r") as f:
@@ -351,16 +361,17 @@ def main() -> None:
         for header, seq in entries[1:]:
             T, sample, score = [float(s.split("=")[1]) for s in header.split(", ")]
             pdb, chain = os.path.basename(file).split(".")[0:2]
-            df = df.append(
+            rows.append(
                 {
                     "name": pdb + "." + chain,
                     "T": T,
                     "score": score,
                     "native": native_score,
                     "similarity": _similarity(native_seq, seq),
-                },
-                ignore_index=True,
+                }
             )
+
+    df = pd.DataFrame(rows, columns=["name", "T", "score", "similarity", "native"])
 
     df["diff"] = -(df["score"] - df["native"])
 
