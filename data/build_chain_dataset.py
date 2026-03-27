@@ -1,5 +1,5 @@
 import os, time, gzip, json
-from util_mmtf import *
+from mmtf_util import *
 from collections import defaultdict
 
 MAX_LENGTH = 500
