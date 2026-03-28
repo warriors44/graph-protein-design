@@ -94,7 +94,9 @@ def main() -> None:
     with open(logfile, 'w') as f:
         f.write(
             'Epoch\tTrain_PPL\tVal_PPL_Proxy\tVal_PPL_ISQ\t'
-            'Train_ELBO\tTrain_NLL\tVal_NLL_Proxy\tVal_NLL_ISQ\n'
+            'Train_ELBO\tTrain_NLL\tVal_NLL_Proxy\tVal_NLL_ISQ\t'
+            'Train_EntropyNorm\tTrain_EntropyPenalty\t'
+            'Train_LossRLOO\tTrain_LossTotal\n'
         )
     with open(base_folder + 'args.json', 'w') as f:
         json.dump(vars(args), f)
@@ -108,6 +110,10 @@ def main() -> None:
     for e in range(args.epochs):
         model.train()
         train_elbo_sum, train_nll_sum, train_weights = 0.0, 0.0, 0.0
+        train_entropy_norm_sum = 0.0
+        train_entropy_penalty_sum = 0.0
+        train_loss_rloo_sum = 0.0
+        train_loss_total_sum = 0.0
 
         for train_i, batch in enumerate(loader_train):
             X, S, mask, lengths = featurize(
@@ -130,14 +136,23 @@ def main() -> None:
             train_elbo_sum += info["elbo"].item() * n_tokens
             train_nll_sum += loss_avg.item() * n_tokens
             train_weights += n_tokens
+            train_entropy_norm_sum += info["entropy_q_normalized"].item() * n_tokens
+            train_entropy_penalty_sum += info["entropy_penalty"].item() * n_tokens
+            train_loss_rloo_sum += info["loss_rloo"].item() * n_tokens
+            train_loss_total_sum += info["loss_total"].item() * n_tokens
 
             if total_step % 100 == 0:
                 elapsed = time.time() - start_train
                 print(
-                    "Step {} | {:.0f}s | ELBO {:.4f} | NLL {:.4f}"
+                    "Step {} | {:.0f}s | loss_total {:.4f} | loss_rloo {:.4f} | "
+                    "H_norm {:.4f} | ent_pen {:.4f} | ELBO {:.4f} | NLL {:.4f}"
                     " | PPL {:.2f} | dF {:.4f}".format(
                         total_step,
                         elapsed,
+                        info["loss_total"].item(),
+                        info["loss_rloo"].item(),
+                        info["entropy_q_normalized"].item(),
+                        info["entropy_penalty"].item(),
                         info["elbo"].item(),
                         loss_avg.item(),
                         float(np.exp(loss_avg.item())),
@@ -198,6 +213,10 @@ def main() -> None:
 
         train_elbo = train_elbo_sum / train_weights
         train_nll = train_nll_sum / train_weights
+        train_entropy_norm = train_entropy_norm_sum / train_weights
+        train_entropy_penalty = train_entropy_penalty_sum / train_weights
+        train_loss_rloo = train_loss_rloo_sum / train_weights
+        train_loss_total = train_loss_total_sum / train_weights
         val_nll_proxy = val_proxy_sum / val_proxy_weights
         val_ppl_proxy = np.exp(val_nll_proxy)
         if run_full_isq:
@@ -210,18 +229,24 @@ def main() -> None:
 
         print(
             'Epoch {} | Train ELBO {:.4f} | Train PPL {:.2f} | '
-            'Val Proxy PPL {:.2f} | Val ISQ PPL {}'.format(
+            'Val Proxy PPL {:.2f} | Val ISQ PPL {} | '
+            'H_norm {:.4f} | ent_pen {:.4f} | L_rloo {:.4f} | L_total {:.4f}'.format(
                 epoch_num,
                 train_elbo,
                 train_ppl,
                 val_ppl_proxy,
                 '{:.2f}'.format(val_ppl_isq) if run_full_isq else 'nan',
+                train_entropy_norm,
+                train_entropy_penalty,
+                train_loss_rloo,
+                train_loss_total,
             )
         )
 
         with open(logfile, 'a') as f:
             f.write(
-                '{}\t{}\t{}\t{}\t{:.4f}\t{:.4f}\t{:.4f}\t{}\n'.format(
+                '{}\t{}\t{}\t{}\t{:.4f}\t{:.4f}\t{:.4f}\t{}\t'
+                '{:.4f}\t{:.4f}\t{:.4f}\t{:.4f}\n'.format(
                     epoch_num,
                     train_ppl,
                     val_ppl_proxy,
@@ -230,6 +255,10 @@ def main() -> None:
                     train_nll,
                     val_nll_proxy,
                     val_nll_isq,
+                    train_entropy_norm,
+                    train_entropy_penalty,
+                    train_loss_rloo,
+                    train_loss_total,
                 )
             )
 

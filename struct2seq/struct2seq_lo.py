@@ -525,7 +525,7 @@ class Struct2SeqLO(nn.Module):
 
         F_values: list[torch.Tensor] = []
         log_q_values: list[torch.Tensor] = []
-        H_norm_values: list[torch.Tensor] = []
+        entropy_values: list[torch.Tensor] = []
 
         K = self.num_samples
 
@@ -549,14 +549,14 @@ class Struct2SeqLO(nn.Module):
             ).float()
             remaining_mask = (1.0 - decoded_mask) * mask
 
-            if self.lambda_entropy != 0.0:
-                q_logits_for_ent = q_logits.masked_fill(
-                    remaining_mask == 0, neg_inf,
-                )
-                H_k = Categorical(logits=q_logits_for_ent).entropy()
-                R_t = remaining_mask.sum(dim=-1).clamp(min=2.0)
-                H_norm_k = H_k / torch.log(R_t)
-                H_norm_values.append(H_norm_k)
+            # Entropy of q over remaining positions, normalized by log(R_t)
+            # (same pattern as ProteinMPNN.compute_elbo; always computed).
+            q_logits_for_ent = q_logits.float().masked_fill(
+                remaining_mask == 0, neg_inf,
+            )
+            H_k = Categorical(logits=q_logits_for_ent).entropy()
+            R_t = remaining_mask.sum(dim=-1).clamp(min=2.0)
+            entropy_values.append(H_k / torch.log(R_t))
 
             F_k = self._compute_F_theta(
                 log_probs_k, p_order_logits_k, q_logits, S, remaining_mask,
@@ -594,13 +594,10 @@ class Struct2SeqLO(nn.Module):
         loss_per_elem = -L_tensor * (F_mean + rloo_term)
         loss_raw = loss_per_elem.sum() / L_tensor.sum()
 
-        if self.lambda_entropy != 0.0 and H_norm_values:
-            H_stack = torch.stack(H_norm_values, dim=0)
-            H_normalized = H_stack.mean()
-            loss = loss_raw - self.lambda_entropy * H_normalized
-        else:
-            H_normalized = torch.tensor(0.0, device=device, dtype=loss_raw.dtype)
-            loss = loss_raw
+        H_stack = torch.stack(entropy_values, dim=0)
+        H_normalized = H_stack.mean()
+        entropy_penalty = self.lambda_entropy * H_normalized
+        loss = loss_raw - entropy_penalty
 
         with torch.no_grad():
             elbo_per_res = F_mean.mean()
@@ -613,13 +610,12 @@ class Struct2SeqLO(nn.Module):
             ).squeeze(-1)
             nll_avg = -(log_p_token_all * mask).sum() / mask.sum()
 
-            if self.lambda_entropy != 0.0 and H_norm_values:
-                H_norm_det = H_normalized.detach()
-                entropy_q = H_norm_det
-                entropy_q_weighted = (self.lambda_entropy * H_norm_det)
-            else:
-                entropy_q = torch.tensor(0.0, device=device)
-                entropy_q_weighted = torch.tensor(0.0, device=device)
+            # Monitoring scalars (detached): H / log(R_t) before lambda; after lambda;
+            # RLOO-only loss; full training objective (includes entropy bonus).
+            entropy_q_normalized = H_normalized.detach()
+            entropy_penalty_det = entropy_penalty.detach()
+            loss_rloo_det = loss_raw.detach()
+            loss_total_det = loss.detach()
 
         info = {
             'elbo': elbo_per_res,
@@ -627,9 +623,15 @@ class Struct2SeqLO(nn.Module):
             'F_mean': F_mean.mean(),
             'delta_F_abs': delta_F_abs,
             'i_mean': i_samples.float().mean(),
-            'entropy_q': entropy_q,
-            'entropy_q_weighted': entropy_q_weighted,
-            'elbo_no_penalty': loss_raw.detach(),
+            # Primary names (see .cursor/entropy-bonus.md)
+            'entropy_q_normalized': entropy_q_normalized,
+            'entropy_penalty': entropy_penalty_det,
+            'loss_rloo': loss_rloo_det,
+            'loss_total': loss_total_det,
+            # Backward-compatible aliases
+            'entropy_q': entropy_q_normalized,
+            'entropy_q_weighted': entropy_penalty_det,
+            'elbo_no_penalty': loss_rloo_det,
         }
         return loss, info
 
@@ -674,7 +676,9 @@ class Struct2SeqLO(nn.Module):
         info_with_legacy = dict(info)
         info_with_legacy["reinforce_var"] = info["delta_F_abs"]
         info_with_legacy["loss_p"] = -info["F_mean"]
-        info_with_legacy["loss_reinforce"] = loss.detach() - info_with_legacy["loss_p"]
+        # RLOO gap without entropy bonus: loss_rloo - loss_p (entropy excluded).
+        loss_rloo_scalar = info.get("loss_rloo", info["elbo_no_penalty"])
+        info_with_legacy["loss_reinforce"] = loss_rloo_scalar - info_with_legacy["loss_p"]
         return loss, info_with_legacy
 
     # ------------------------------------------------------------------

@@ -122,18 +122,26 @@ def test_entropy_bonus_keys_and_loss_consistency() -> None:
 
     loss, info = model.compute_elbo_paper(X, S, lengths, mask)
 
+    assert "entropy_q_normalized" in info
+    assert "entropy_penalty" in info
+    assert "loss_rloo" in info
+    assert "loss_total" in info
     assert "entropy_q" in info
     assert "entropy_q_weighted" in info
     assert "elbo_no_penalty" in info
     assert torch.isfinite(info["entropy_q"])
+    assert torch.allclose(info["entropy_q"], info["entropy_q_normalized"])
+    assert torch.allclose(info["entropy_q_weighted"], info["entropy_penalty"])
+    assert torch.allclose(info["elbo_no_penalty"], info["loss_rloo"])
+    assert torch.allclose(loss.detach(), info["loss_total"])
     assert torch.isfinite(info["entropy_q_weighted"])
     assert torch.isfinite(info["elbo_no_penalty"])
 
-    expected = info["elbo_no_penalty"] - 0.01 * info["entropy_q"]
+    expected = info["loss_rloo"] - 0.01 * info["entropy_q_normalized"]
     assert torch.allclose(loss.detach(), expected, rtol=1e-5, atol=1e-6)
     assert torch.allclose(
-        info["entropy_q_weighted"],
-        0.01 * info["entropy_q"],
+        info["entropy_penalty"],
+        0.01 * info["entropy_q_normalized"],
         rtol=1e-5,
         atol=1e-6,
     )
