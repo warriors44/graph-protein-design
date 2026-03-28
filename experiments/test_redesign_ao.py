@@ -45,7 +45,13 @@ import torch.nn.functional as F
 sys.path.insert(0, "..")
 from struct2seq import data, struct2seq_ao
 
-from utils import featurize, get_args, load_checkpoint, setup_device_rng
+from utils import (
+    featurize,
+    get_args,
+    load_checkpoint,
+    setup_device_rng,
+    write_redesign_recovery_stat_txt,
+)
 
 try:
     import pandas as pd  # type: ignore
@@ -340,6 +346,7 @@ def main() -> None:
 
     df_mean = df.groupby(["name", "T"], as_index=False).mean()
     df_mean.to_csv(base_folder + "results.csv")
+    write_redesign_recovery_stat_txt(base_folder, df)
 
 
 if __name__ == "__main__":

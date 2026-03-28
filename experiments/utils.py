@@ -377,3 +377,46 @@ def loss_smoothed_reweight(S, log_probs, mask, weight=0.1, factor=10.):
     mask_reweight = mask * reweights
     loss_av = torch.sum(loss * mask_reweight) / torch.sum(mask_reweight)
     return loss, loss_av
+
+
+def write_redesign_recovery_stat_txt(base_folder, df):
+    """Write native-sequence recovery (similarity) mean and variance to stat.txt.
+
+    Args:
+        base_folder: Log directory (same convention as other redesign outputs).
+        df: pandas DataFrame with columns 'similarity' and 'T'.
+
+    Variance uses the unbiased sample estimator (ddof=1). When n<2, variance is NaN.
+    """
+    path = base_folder + "stat.txt"
+    lines = [
+        "# Native sequence recovery (similarity): mean and variance",
+        "# variance: unbiased sample variance (ddof=1); NaN if n<2",
+        "",
+        "scope\tmean\tvariance\tn",
+    ]
+    n_all = int(len(df))
+    if n_all == 0:
+        lines.append("(no rows)")
+    else:
+        mean_all = float(df["similarity"].mean())
+        if n_all >= 2:
+            var_str = "{:.8f}".format(float(df["similarity"].var(ddof=1)))
+        else:
+            var_str = "nan"
+        lines.append("all\t{:.8f}\t{}\t{}".format(mean_all, var_str, n_all))
+        for T_val in sorted(df["T"].unique()):
+            sub = df[df["T"] == T_val]
+            n_t = int(len(sub))
+            if n_t == 0:
+                continue
+            m_t = float(sub["similarity"].mean())
+            if n_t >= 2:
+                v_t = float(sub["similarity"].var(ddof=1))
+                v_str = "{:.8f}".format(v_t)
+            else:
+                v_str = "nan"
+            lines.append("T={}\t{:.8f}\t{}\t{}".format(T_val, m_t, v_str, n_t))
+
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")

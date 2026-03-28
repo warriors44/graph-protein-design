@@ -18,7 +18,13 @@ from struct2seq import data, struct2seq  # type: ignore
 from matplotlib import pyplot as plt
 import pandas as pd  # type: ignore
 
-from utils import featurize, get_args, load_checkpoint, setup_device_rng
+from utils import (
+    featurize,
+    get_args,
+    load_checkpoint,
+    setup_device_rng,
+    write_redesign_recovery_stat_txt,
+)
 
 
 def _scores(
@@ -209,6 +215,7 @@ def main() -> None:
 
     df_mean = df.groupby(["name", "T"], as_index=False).mean()
     df_mean.to_csv(base_folder + "results.csv")
+    write_redesign_recovery_stat_txt(base_folder, df)
 
     print(f"Speed total: {residues_per_second} residues / s")
     print("Median", df_mean["similarity"].median())
