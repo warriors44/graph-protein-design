@@ -218,6 +218,7 @@ def main() -> None:
         raise ValueError("--order_mode must be 'fix_order' or 'any_order' for AO.")
     order_cfg = OrderConfig(mode=str(order_mode))
 
+    order_prefix="ao" if order_cfg.mode == "any_order" else "fo" if order_cfg.mode == "fix_order" else "lo"
     # Load test set
     with open(args.file_splits) as f:
         dataset_splits = json.load(f)
@@ -229,9 +230,9 @@ def main() -> None:
 
     # Output folders
     if args.name != '':
-        base_folder = 'log/' + args.name + '/'
+        base_folder = 'log/' + args.name + '/' + order_prefix + '_spin2' + '/'
     else:
-        base_folder = time.strftime("test/%y%b%d_%I%M%p/", time.localtime())
+        base_folder = time.strftime("test/%y%b%d_%I%M%p/" + order_prefix + "_spin2" + "/", time.localtime())
     os.makedirs(base_folder, exist_ok=True)
     os.makedirs(base_folder + "alignments", exist_ok=True)
     with open(base_folder + "/hyperparams.json", "w") as f:

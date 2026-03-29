@@ -254,16 +254,26 @@ def main() -> None:
         )
     order_cfg = OrderConfig(mode=str(order_mode))
 
-    order_prefix="lo" if order_cfg.mode == "learning_order" else "fo" if order_cfg.mode == "fix_order" else "ao"
-    if args.name != '':
-        base_folder = 'log/' + args.name + '/' + order_prefix + '/'
+    order_prefix = (
+        "lo"
+        if order_cfg.mode == "learning_order"
+        else "fo"
+        if order_cfg.mode == "fix_order"
+        else "ao"
+    )
+    if args.name != "":
+        base_folder = "log/" + args.name + "/" + order_prefix + "/"
     else:
-        base_folder = time.strftime("test/%y%b%d_%I%M%p/", time.localtime())
-        
+        base_folder = time.strftime(
+            "test/%y%b%d_%I%M%p/" + order_prefix + "/",
+            time.localtime(),
+        )
+
     os.makedirs(base_folder, exist_ok=True)
     os.makedirs(base_folder + "alignments", exist_ok=True)
     with open(base_folder + "/hyperparams.json", "w") as f:
         json.dump(vars(args), f)
+
     # Load test set
     with open(args.file_splits) as f:
         dataset_splits = json.load(f)
@@ -272,17 +282,6 @@ def main() -> None:
     dataset_indices = {d["name"]: i for i, d in enumerate(dataset)}
     test_set = torch.utils.data.Subset(dataset, [dataset_indices[name] for name in test_names])
     print("Testing {} domains".format(len(test_set)))
-
-    order_prefix="lo" if order_cfg.mode == "learning_order" else "fo" if order_cfg.mode == "fix_order" else "ao"
-    if args.name != '':
-        base_folder = 'log/' + args.name + '/' + order_prefix + '/'
-    else:
-        base_folder = time.strftime("test/%y%b%d_%I%M%p/", time.localtime())
-        
-    os.makedirs(base_folder, exist_ok=True)
-    os.makedirs(base_folder + "alignments", exist_ok=True)
-    with open(base_folder + "/hyperparams.json", "w") as f:
-        json.dump(vars(args), f)
 
     BATCH_COPIES = 50
     NUM_BATCHES = 1
