@@ -262,10 +262,10 @@ def main() -> None:
         else "ao"
     )
     if args.name != "":
-        base_folder = "log/" + args.name + "/" + order_prefix + "/"
+        base_folder = "log/" + args.name + "/" + order_prefix + "_spin2" + "/"
     else:
         base_folder = time.strftime(
-            "test/%y%b%d_%I%M%p/" + order_prefix + "/",
+            "test/%y%b%d_%I%M%p/" + order_prefix + "_spin2" + "/",
             time.localtime(),
         )
 
@@ -313,9 +313,6 @@ def main() -> None:
                                 mask,
                                 temperature=float(temp),
                             )
-                            permutation_used = _normalize_ordering_to_full_permutation(
-                                _ordering, mask,
-                            )
                         else:
                             full_perm = _make_full_permutation(mask, order_cfg)
                             S_sample = _sample_with_permutation_lo(
@@ -326,10 +323,9 @@ def main() -> None:
                                 full_perm=full_perm,
                                 temperature=float(temp),
                             )
-                            permutation_used = full_perm
 
                         log_probs_sample = model(
-                            X, S_sample, lengths, mask, permutation=permutation_used,
+                            X, S_sample, lengths, mask,
                         )
                         scores = _scores(S_sample, log_probs_sample, mask).cpu().numpy()
 

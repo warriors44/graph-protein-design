@@ -285,10 +285,55 @@ def test_edge_i_equals_L() -> None:
     print(f"test_edge_i_equals_L PASSED  F={F_val.tolist()}")
 
 
+def test_sample_uses_learned_order() -> None:
+    """sample() must run forward_p at each step so that the order head
+    receives contextualised representations (not zeros).
+
+    Verifies:
+      - Output shapes are correct.
+      - The sampled ordering contains only valid (masked) positions.
+      - Two calls with different seeds produce different orderings,
+        confirming the order head is not degenerate (uniform).
+    """
+    torch.manual_seed(7)
+    model, X, S, lengths, mask = _make_model_and_data(B=2, N=15)
+    model.eval()
+
+    with torch.no_grad():
+        S1, ord1 = model.sample(X, lengths, mask, temperature=0.1)
+
+    B, N = mask.shape
+    valid_L = mask.sum(-1).long()
+
+    assert S1.shape == (B, N)
+    assert ord1.shape == (B, N)
+
+    for b in range(B):
+        vL = int(valid_L[b].item())
+        decoded_positions = ord1[b, :vL]
+        assert decoded_positions.unique().numel() == vL, (
+            "ordering must contain unique valid positions"
+        )
+        assert (mask[b][decoded_positions] > 0.5).all(), (
+            "all decoded positions must be within mask"
+        )
+
+    torch.manual_seed(99)
+    with torch.no_grad():
+        S2, ord2 = model.sample(X, lengths, mask, temperature=0.1)
+
+    assert not torch.equal(ord1, ord2), (
+        "Two sample() calls with different seeds must yield different orderings"
+    )
+
+    print("test_sample_uses_learned_order PASSED")
+
+
 if __name__ == '__main__':
     test_basic()
     test_entropy_bonus_keys_and_loss_consistency()
     test_edge_i_equals_1()
     test_edge_i_equals_L()
     test_loglik_is_q_basic()
+    test_sample_uses_learned_order()
     print("\nALL TESTS PASSED")

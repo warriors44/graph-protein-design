@@ -1104,9 +1104,11 @@ class Struct2SeqLO(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Autoregressive sampling using the learned order (p_theta only).
 
-        At each step:
-          1. Compute order logits for remaining positions -> select next position.
-          2. Compute amino acid logits for the selected position -> sample token.
+        At each step a full ``forward_p`` pass is executed so that the order
+        head ``W_order_p`` receives the same contextualised representations it
+        sees during training (via ``compute_elbo_paper``).  A running
+        permutation is maintained with vectorised swaps to supply
+        ``_build_partial_ar_mask`` at each step.
 
         Args:
             X: coordinates [B, N, 4, 3].
@@ -1120,77 +1122,55 @@ class Struct2SeqLO(nn.Module):
         """
         h_V_enc, h_E, E_idx, _ = self._encode(X, L, mask)
 
-        B, N_nodes = X.size(0), X.size(1)
+        B, N = mask.shape[:2]
         device = X.device
 
-        S = torch.zeros(B, N_nodes, dtype=torch.long, device=device)
-        ordering = torch.zeros(B, N_nodes, dtype=torch.long, device=device)
-        decoded_mask = torch.zeros(B, N_nodes, device=device)
-        h_S = torch.zeros_like(h_V_enc)
+        S = torch.zeros(B, N, dtype=torch.long, device=device)
+        ordering = torch.zeros(B, N, dtype=torch.long, device=device)
+        decoded_mask = torch.zeros(B, N, device=device)
 
-        h_V_stack = [h_V_enc.clone()] + [
-            torch.zeros_like(h_V_enc) for _ in range(len(self.decoder_layers))
-        ]
+        valid_L = mask.sum(-1).long()
+        max_steps = int(valid_L.max().item()) if B > 0 else 0
+        batch_idx = torch.arange(B, device=device)
 
-        for t in range(N_nodes):
-            remaining = (mask - decoded_mask)
+        temp_perm = torch.arange(N, device=device).unsqueeze(0).expand(B, -1).clone()
+        inv_perm = temp_perm.clone()
 
-            if remaining.sum() == 0:
+        for t in range(max_steps):
+            active = valid_L > t
+            if not active.any():
                 break
 
-            # --- Select next position via p_theta order head ---
-            h_V_current = h_V_stack[-1]
-            order_logits = self.W_order_p(h_V_current).squeeze(-1)
-            order_logits = order_logits.masked_fill(remaining == 0, float('-inf'))
-            order_logits = order_logits / temperature
+            i_samples = torch.full((B,), t + 1, dtype=torch.long, device=device)
+            i_samples = torch.min(i_samples, valid_L)
+            ar_mask = self._build_partial_ar_mask(E_idx, temp_perm, i_samples)
 
-            order_probs = F.softmax(order_logits, dim=-1)
-            pos = torch.multinomial(order_probs, 1).squeeze(-1)
+            log_probs, p_order_logits = self.forward_p(
+                h_V_enc, h_E, E_idx, S, mask, ar_mask=ar_mask,
+            )
+
+            remaining = mask - decoded_mask
+            p_order_logits = p_order_logits.masked_fill(remaining == 0, float('-inf'))
+
+            pos = torch.zeros(B, dtype=torch.long, device=device)
+            order_probs = F.softmax(p_order_logits[active] / temperature, dim=-1)
+            pos[active] = torch.multinomial(order_probs, 1).squeeze(-1)
             ordering[:, t] = pos
 
-            # --- Decode amino acid at the selected position ---
-            for b in range(B):
-                p = pos[b].item()
-                E_idx_p = E_idx[b:b+1, p:p+1, :]
-                h_E_p = h_E[b:b+1, p:p+1, :, :]
-                h_ES_p = cat_neighbors_nodes(
-                    h_S[b:b+1], h_E_p, E_idx_p,
-                )
+            logits_pos = log_probs[batch_idx, pos, :] / temperature
+            token_probs = F.softmax(logits_pos[active], dim=-1)
+            S[batch_idx[active], pos[active]] = torch.multinomial(
+                token_probs, 1,
+            ).squeeze(-1)
 
-                neighbor_decoded = torch.gather(
-                    decoded_mask[b:b+1],  # [1, N_nodes]
-                    1,
-                    E_idx_p.squeeze(1),   # [1, K]
-                ).unsqueeze(1).unsqueeze(-1)  # [1, 1, K, 1]
-                mask_bw_p = neighbor_decoded
-                mask_fw_p = 1.0 - neighbor_decoded
+            idx_in_perm = torch.gather(inv_perm, 1, pos.unsqueeze(-1)).squeeze(-1)
+            old_at_t = temp_perm[:, t].clone()
+            t_col = torch.full((B, 1), t, dtype=torch.long, device=device)
+            temp_perm[:, t] = pos
+            temp_perm.scatter_(1, idx_in_perm.unsqueeze(-1), old_at_t.unsqueeze(-1))
+            inv_perm.scatter_(1, pos.unsqueeze(-1), t_col)
+            inv_perm.scatter_(1, old_at_t.unsqueeze(-1), idx_in_perm.unsqueeze(-1))
 
-                h_ES_encoder_p = cat_neighbors_nodes(
-                    torch.zeros_like(h_S[b:b+1]), h_E_p, E_idx_p,
-                )
-                h_ESV_encoder_p = cat_neighbors_nodes(
-                    h_V_enc[b:b+1], h_ES_encoder_p, E_idx_p,
-                )
-                h_ESV_encoder_fw_p = mask_fw_p * h_ESV_encoder_p
-
-                for l, dec_layer in enumerate(self.decoder_layers):
-                    h_ESV_decoder_p = cat_neighbors_nodes(
-                        h_V_stack[l][b:b+1], h_ES_p, E_idx_p,
-                    )
-                    h_V_p = h_V_stack[l][b:b+1, p:p+1, :]
-                    h_ESV_p = mask_bw_p * h_ESV_decoder_p + h_ESV_encoder_fw_p
-                    h_V_stack[l + 1][b, p, :] = dec_layer(
-                        h_V_p, h_ESV_p, mask_V=mask[b:b+1, p:p+1],
-                    ).squeeze(0).squeeze(0)
-
-                h_V_final = h_V_stack[-1][b, p, :]
-                token_logits = self.W_out(h_V_final) / temperature
-                token_probs = F.softmax(token_logits, dim=-1)
-                S_p = torch.multinomial(token_probs.unsqueeze(0), 1).squeeze(-1).squeeze(0)
-
-                S[b, p] = S_p
-                h_S[b, p, :] = self.W_s(S_p)
-
-            decoded_mask.scatter_(1, pos.unsqueeze(-1), 1.0)
+            decoded_mask.scatter_(1, pos[active].unsqueeze(-1), 1.0)
 
         return S, ordering
