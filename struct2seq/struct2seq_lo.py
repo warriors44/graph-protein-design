@@ -610,6 +610,19 @@ class Struct2SeqLO(nn.Module):
             ).squeeze(-1)
             nll_avg = -(log_p_token_all * mask).sum() / mask.sum()
 
+            # q_theta order logits range over valid positions (padding masked to +/-inf).
+            q_stats = q_logits.detach().float()
+            pos_inf = float("inf")
+            per_seq_max = q_stats.masked_fill(mask == 0, float("-inf")).amax(dim=-1)
+            per_seq_min = q_stats.masked_fill(mask == 0, pos_inf).amin(dim=-1)
+            valid_b = mask.sum(dim=-1) > 0
+            if bool(valid_b.any().item()):
+                q_logits_max = per_seq_max[valid_b].max()
+                q_logits_min = per_seq_min[valid_b].min()
+            else:
+                q_logits_max = torch.zeros((), device=q_stats.device, dtype=q_stats.dtype)
+                q_logits_min = torch.zeros((), device=q_stats.device, dtype=q_stats.dtype)
+
             # Monitoring scalars (detached): H / log(R_t) before lambda; after lambda;
             # RLOO-only loss; full training objective (includes entropy bonus).
             entropy_q_normalized = H_normalized.detach()
@@ -628,6 +641,8 @@ class Struct2SeqLO(nn.Module):
             'entropy_penalty': entropy_penalty_det,
             'loss_rloo': loss_rloo_det,
             'loss_total': loss_total_det,
+            'q_logits_max': q_logits_max,
+            'q_logits_min': q_logits_min,
             # Backward-compatible aliases
             'entropy_q': entropy_q_normalized,
             'entropy_q_weighted': entropy_penalty_det,
