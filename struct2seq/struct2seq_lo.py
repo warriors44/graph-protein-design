@@ -52,6 +52,8 @@ class Struct2SeqLO(nn.Module):
         separate_encoder: bool = False,
         separate_decoder: bool = False,
         lambda_entropy: float = 0.0,
+        burial_kl_beta: float = 0.0,
+        burial_kl_tau: float = 2.0,
     ) -> None:
         super(Struct2SeqLO, self).__init__()
 
@@ -91,6 +93,8 @@ class Struct2SeqLO(nn.Module):
         self.separate_encoder = separate_encoder
         self.separate_decoder = separate_decoder
         self.lambda_entropy = float(lambda_entropy)
+        self.burial_kl_beta = float(burial_kl_beta)
+        self.burial_kl_tau = float(burial_kl_tau)
 
         # Featurization
         self.features = ProteinFeatures(
@@ -163,6 +167,14 @@ class Struct2SeqLO(nn.Module):
         for p in self.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
+
+    # ------------------------------------------------------------------
+    # Burial KL beta scheduling
+    # ------------------------------------------------------------------
+
+    def set_burial_kl_beta(self, beta: float) -> None:
+        """Update the burial-prior KL coefficient (called per-epoch)."""
+        self.burial_kl_beta = float(beta)
 
     # ------------------------------------------------------------------
     # Encoder
@@ -474,6 +486,51 @@ class Struct2SeqLO(nn.Module):
         return F_val
 
     # ------------------------------------------------------------------
+    # Burial-based prior logits for KL regularisation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _compute_burial_prior_logits(
+        X: torch.Tensor,
+        mask: torch.Tensor,
+        tau: float,
+        k_neighbors: int = 8,
+    ) -> torch.Tensor:
+        """Compute per-position prior logits from Cα burial depth.
+
+        Buried residues (small average Cα–Cα distance to nearest neighbours)
+        receive higher logits, biasing the Plackett-Luce prior toward a
+        "decode buried residues first" ordering.
+
+        Args:
+            X: atom coordinates [B, N, 4, 3] (N, Cα, C, O order).
+            mask: padding mask [B, N], 1 = valid.
+            tau: temperature scaling for the prior.
+            k_neighbors: number of nearest Cα neighbours to average over.
+
+        Returns:
+            pi_logits: [B, N] with padding positions set to -inf.
+        """
+        ca = X[:, :, 1, :]
+        dists = torch.cdist(ca, ca)
+
+        large_val = dists.max().detach() + 1.0
+        mask_2d = mask.unsqueeze(1) * mask.unsqueeze(2)
+        dists = dists + (1.0 - mask_2d) * large_val
+
+        eye = torch.eye(dists.size(1), device=dists.device, dtype=dists.dtype)
+        dists = dists + eye.unsqueeze(0) * large_val
+
+        k = min(k_neighbors, int(mask.sum(-1).min().item()) - 1)
+        k = max(k, 1)
+        topk_dists, _ = dists.topk(k, dim=-1, largest=False)
+        burial_score = topk_dists.mean(dim=-1)
+
+        pi_logits = -burial_score / tau
+        pi_logits = pi_logits.masked_fill(mask == 0, float('-inf'))
+        return pi_logits
+
+    # ------------------------------------------------------------------
     # Paper-faithful ELBO (Algorithm 1, Eqs. 8/9/11)
     # ------------------------------------------------------------------
 
@@ -519,6 +576,31 @@ class Struct2SeqLO(nn.Module):
         L_tensor = torch.tensor(L, dtype=torch.float, device=device)
         valid_L = mask.sum(-1)
 
+        neg_inf = float("-inf")
+
+        if self.burial_kl_beta > 0:
+            pi_logits = self._compute_burial_prior_logits(
+                X, mask, self.burial_kl_tau,
+            )
+            mask_bool = mask.bool()
+            q_masked = q_logits.masked_fill(~mask_bool, neg_inf)
+            pi_masked = pi_logits.masked_fill(~mask_bool, neg_inf)
+            log_q_cat = F.log_softmax(q_masked, dim=-1)
+            log_pi_cat = F.log_softmax(pi_masked, dim=-1)
+            # Floor log-probs to prevent -inf at valid positions (float32
+            # underflow when the prior is very peaky) which would cause
+            # inf/NaN in the KL via  q*(log_q - (-inf)) = q*inf.
+            log_pi_cat = log_pi_cat.clamp(min=-30.0)
+            log_q_cat_safe = log_q_cat.clamp(min=-30.0)
+            q_probs_cat = torch.exp(log_q_cat)
+            kl_pointwise = q_probs_cat * (log_q_cat_safe - log_pi_cat)
+            kl_per_elem = torch.where(
+                mask_bool, kl_pointwise, torch.zeros_like(kl_pointwise),
+            ).sum(-1)
+            kl_mean = kl_per_elem.mean()
+        else:
+            kl_mean = torch.zeros((), device=device)
+
         i_samples = (
             torch.rand(B, device=device) * valid_L
         ).long() + 1
@@ -528,8 +610,6 @@ class Struct2SeqLO(nn.Module):
         entropy_values: list[torch.Tensor] = []
 
         K = self.num_samples
-
-        neg_inf = float("-inf")
 
         for _ in range(K):
             full_perm = gumbel_top_k(q_logits.detach())
@@ -597,7 +677,8 @@ class Struct2SeqLO(nn.Module):
         H_stack = torch.stack(entropy_values, dim=0)
         H_normalized = H_stack.mean()
         entropy_penalty = self.lambda_entropy * H_normalized
-        loss = loss_raw - entropy_penalty
+        burial_kl_term = self.burial_kl_beta * kl_mean
+        loss = loss_raw - entropy_penalty + burial_kl_term
 
         with torch.no_grad():
             elbo_per_res = F_mean.mean()
@@ -623,12 +704,12 @@ class Struct2SeqLO(nn.Module):
                 q_logits_max = torch.zeros((), device=q_stats.device, dtype=q_stats.dtype)
                 q_logits_min = torch.zeros((), device=q_stats.device, dtype=q_stats.dtype)
 
-            # Monitoring scalars (detached): H / log(R_t) before lambda; after lambda;
-            # RLOO-only loss; full training objective (includes entropy bonus).
             entropy_q_normalized = H_normalized.detach()
             entropy_penalty_det = entropy_penalty.detach()
             loss_rloo_det = loss_raw.detach()
             loss_total_det = loss.detach()
+            kl_q_pi_det = kl_mean.detach()
+            burial_kl_term_det = burial_kl_term.detach()
 
         info = {
             'elbo': elbo_per_res,
@@ -636,13 +717,14 @@ class Struct2SeqLO(nn.Module):
             'F_mean': F_mean.mean(),
             'delta_F_abs': delta_F_abs,
             'i_mean': i_samples.float().mean(),
-            # Primary names (see .cursor/entropy-bonus.md)
             'entropy_q_normalized': entropy_q_normalized,
             'entropy_penalty': entropy_penalty_det,
             'loss_rloo': loss_rloo_det,
             'loss_total': loss_total_det,
             'q_logits_max': q_logits_max,
             'q_logits_min': q_logits_min,
+            'kl_q_pi': kl_q_pi_det,
+            'burial_kl_term': burial_kl_term_det,
             # Backward-compatible aliases
             'entropy_q': entropy_q_normalized,
             'entropy_q_weighted': entropy_penalty_det,

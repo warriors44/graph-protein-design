@@ -94,6 +94,28 @@ def get_args():
         ),
     )
     parser.add_argument(
+        '--burial_kl_beta0',
+        type=float,
+        default=0.0,
+        help=(
+            'Initial KL coefficient for burial-based prior on q(z). '
+            'Linearly annealed to 0 over --burial_kl_anneal_epochs. '
+            '0 disables the burial prior.'
+        ),
+    )
+    parser.add_argument(
+        '--burial_kl_tau',
+        type=float,
+        default=2.0,
+        help='Temperature for the burial prior (lower = sharper prior).',
+    )
+    parser.add_argument(
+        '--burial_kl_anneal_epochs',
+        type=int,
+        default=100,
+        help='Number of epochs over which burial KL beta decays to 0.',
+    )
+    parser.add_argument(
         '--eval_mode',
         type=str,
         default='fixed',
