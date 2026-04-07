@@ -37,7 +37,13 @@ class NoamOpt:
     def zero_grad(self) -> None:
         self.optimizer.zero_grad()
         
-def get_std_opt(parameters: Iterable[torch.nn.Parameter], d_model: int) -> NoamOpt:
+def get_std_opt(
+    parameters: Iterable[torch.nn.Parameter],
+    d_model: int,
+    factor: float = 2,
+    warmup: int = 4000,
+) -> NoamOpt:
     return NoamOpt(
-        d_model, 2, 4000, torch.optim.Adam(parameters, lr=0, betas=(0.9, 0.98), eps=1e-9)
+        d_model, factor, warmup,
+        torch.optim.Adam(parameters, lr=0, betas=(0.9, 0.98), eps=1e-9),
     )

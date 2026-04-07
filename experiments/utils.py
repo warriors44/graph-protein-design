@@ -115,6 +115,46 @@ def get_args():
         default=100,
         help='Number of epochs over which burial KL beta decays to 0.',
     )
+
+    # Variational EM (alternating p/q optimisation)
+    parser.add_argument(
+        '--em_mode',
+        type=str,
+        default='joint',
+        choices=['joint', 'alternating'],
+        help=(
+            'Training mode: joint (default, standard simultaneous update) or '
+            'alternating (variational EM with separate p/q phases).'
+        ),
+    )
+    parser.add_argument(
+        '--warmup_p_epochs',
+        type=int,
+        default=50,
+        help='Phase-1 epochs: train p only before starting EM cycles.',
+    )
+    parser.add_argument(
+        '--epochs_per_m_step',
+        type=int,
+        default=5,
+        help='Number of epochs per M-step (p update) in each EM cycle.',
+    )
+    parser.add_argument(
+        '--epochs_per_e_step',
+        type=int,
+        default=15,
+        help='Number of epochs per E-step (q update) in each EM cycle.',
+    )
+    parser.add_argument(
+        '--q_lr_factor',
+        type=float,
+        default=0.2,
+        help=(
+            'Noam scheduler factor for the q optimizer '
+            '(base p factor is 2; 0.2 gives ~1/10 of the p peak LR).'
+        ),
+    )
+
     parser.add_argument(
         '--eval_mode',
         type=str,

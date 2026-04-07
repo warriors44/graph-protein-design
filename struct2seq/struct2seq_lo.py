@@ -177,6 +177,42 @@ class Struct2SeqLO(nn.Module):
         self.burial_kl_beta = float(beta)
 
     # ------------------------------------------------------------------
+    # Parameter groups for alternating (EM-style) optimisation
+    # ------------------------------------------------------------------
+
+    def p_parameters(self) -> torch.nn.ParameterList:
+        """Yield parameters belonging to the generative model p_theta.
+
+        Includes shared embedding layers (features, W_v, W_e, W_s),
+        the p encoder, p decoder, token head, and order-policy head.
+        """
+        modules: list[nn.Module] = [
+            self.features,
+            self.W_v,
+            self.W_e,
+            self.W_s,
+            self.encoder_layers,
+            self.decoder_layers,
+            self.W_out,
+            self.W_order_p,
+        ]
+        for m in modules:
+            yield from m.parameters()
+
+    def q_parameters(self) -> torch.nn.ParameterList:
+        """Yield parameters belonging to the variational posterior q_theta.
+
+        Only includes q-specific layers; shared embeddings belong to p.
+        """
+        if self.separate_encoder:
+            yield from self.q_encoder_layers.parameters()
+        if self.separate_decoder:
+            yield from self.q_decoder_layers.parameters()
+            yield from self.W_order_q_sep.parameters()
+        else:
+            yield from self.W_order_q.parameters()
+
+    # ------------------------------------------------------------------
     # Encoder
     # ------------------------------------------------------------------
 
@@ -711,10 +747,17 @@ class Struct2SeqLO(nn.Module):
             kl_q_pi_det = kl_mean.detach()
             burial_kl_term_det = burial_kl_term.detach()
 
+            # RLOO / advantage diagnostics
+            adv_mean = adv.mean()
+            adv_std = adv.std()
+            log_q_partial_stack = log_q_stack.detach()
+            log_q_partial_mean = log_q_partial_stack.mean()
+            log_q_partial_std = log_q_partial_stack.std()
+
         info = {
             'elbo': elbo_per_res,
             'nll': nll_avg,
-            'F_mean': F_mean.mean(),
+            'F_mean': F_mean.mean().detach(),
             'delta_F_abs': delta_F_abs,
             'i_mean': i_samples.float().mean(),
             'entropy_q_normalized': entropy_q_normalized,
@@ -725,6 +768,10 @@ class Struct2SeqLO(nn.Module):
             'q_logits_min': q_logits_min,
             'kl_q_pi': kl_q_pi_det,
             'burial_kl_term': burial_kl_term_det,
+            'adv_mean': adv_mean,
+            'adv_std': adv_std,
+            'log_q_partial_mean': log_q_partial_mean,
+            'log_q_partial_std': log_q_partial_std,
             # Backward-compatible aliases
             'entropy_q': entropy_q_normalized,
             'entropy_q_weighted': entropy_penalty_det,
