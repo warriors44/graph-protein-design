@@ -612,7 +612,6 @@ def main() -> None:
     model.eval()
     with torch.no_grad():
         test_proxy_sum, test_proxy_weights = 0.0, 0.0
-        test_isq_sum, test_isq_weights = 0.0, 0.0
         for _, batch in enumerate(loader_test):
             X, S, mask, lengths = featurize(batch, device)
 
@@ -627,32 +626,17 @@ def main() -> None:
             test_proxy_sum += -(proxy_loglik_per_res * L_proxy).sum().cpu().item()
             test_proxy_weights += L_proxy.sum().cpu().item()
 
-            isq_loglik_per_res = model.compute_loglik_is_q(
-                X, S, lengths, mask,
-                num_samples_eval=args.eval_num_samples,
-            )
-            L_isq = torch.tensor(
-                lengths, dtype=torch.float32,
-                device=isq_loglik_per_res.device,
-            )
-            test_isq_sum += -(isq_loglik_per_res * L_isq).sum().cpu().item()
-            test_isq_weights += L_isq.sum().cpu().item()
-
-    test_ppl_proxy = np.exp(test_proxy_sum / test_proxy_weights)
-    test_ppl_isq = np.exp(test_isq_sum / test_isq_weights)
-    print('Perplexity\tTest Proxy:{}\tTest ISQ:{}'.format(
-        test_ppl_proxy, test_ppl_isq,
-    ))
+    test_nll_proxy = test_proxy_sum / test_proxy_weights
+    test_ppl_proxy = float(np.exp(test_nll_proxy))
+    print('Perplexity\tTest Mean-NLL:{}'.format(test_ppl_proxy))
 
     with open(base_folder + 'results.txt', 'w') as f:
         f.write(
-            'Best epoch (proxy): {}\nPerplexities:\n\tTrain: {}\n\tValidation Proxy: {}\n'
-            '\tTest Proxy: {}\n\tTest ISQ: {}'.format(
+            'Best epoch (proxy): {}\nPerplexities:\n\tValidation: {}\n'
+            '\tTest: {}'.format(
                 best_idx + 1,
-                epoch_losses_valid[best_idx],
                 best_validation_ppl_proxy,
                 test_ppl_proxy,
-                test_ppl_isq,
             )
         )
 

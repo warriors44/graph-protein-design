@@ -230,9 +230,9 @@ def main() -> None:
 
     # Output folders
     if args.name != '':
-        base_folder = 'log/' + args.name + '/' + order_prefix + '_spin2' + '/'
+        base_folder = 'log/' + args.name + '/' + order_prefix + '_cath' + '/'
     else:
-        base_folder = time.strftime("test/%y%b%d_%I%M%p/" + order_prefix + "_spin2" + "/", time.localtime())
+        base_folder = time.strftime("test/%y%b%d_%I%M%p/" + order_prefix + "_cath" + "/", time.localtime())
     os.makedirs(base_folder, exist_ok=True)
     os.makedirs(base_folder + "alignments", exist_ok=True)
     with open(base_folder + "/hyperparams.json", "w") as f:

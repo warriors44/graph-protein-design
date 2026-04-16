@@ -262,10 +262,10 @@ def main() -> None:
         else "ao"
     )
     if args.name != "":
-        base_folder = "log/" + args.name + "/" + order_prefix + "_spin2" + "/"
+        base_folder = "log/" + args.name + "/" + order_prefix + "_cath" + "/"
     else:
         base_folder = time.strftime(
-            "test/%y%b%d_%I%M%p/" + order_prefix + "_spin2" + "/",
+            "test/%y%b%d_%I%M%p/" + order_prefix + "_cath" + "/",
             time.localtime(),
         )
 

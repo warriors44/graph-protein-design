@@ -936,15 +936,11 @@ class Struct2SeqLO(nn.Module):
         mask: torch.Tensor,
         num_samples_eval: int | None = None,
     ) -> torch.Tensor:
-        """Estimate log p_theta(x | s) with q-sampled orders and p(x|z,s) only.
+        """Estimate E_{z~q}[log p_theta(x | z, s)] with q-sampled orders.
 
-        This is a lightweight proxy metric for frequent validation:
-          1. Sample K permutations z^(k) ~ q_theta(z | x, s).
-          2. For each z^(k), run one forward_p(permutation=z^(k)) call.
-          3. Aggregate log p_theta(x | z^(k), s) with log-sum-exp.
-
-        Unlike compute_loglik_is_q, this method does NOT include importance
-        weights p_theta(z|s) / q_theta(z|x,s), so it is faster but biased.
+        Samples K permutations from q_theta and computes the arithmetic mean
+        of per-order log-likelihoods.  This is directly comparable to
+        fixed-order models' NLL and equals the ELBO (without KL/entropy terms).
 
         Args:
             X: coordinates [B, N, 4, 3].
@@ -954,8 +950,7 @@ class Struct2SeqLO(nn.Module):
             num_samples_eval: number of q samples K. If None, defaults to 8.
 
         Returns:
-            loglik_per_res: [B] proxy per-residue log-likelihood estimates
-                log p_theta(x | s) / L_b for each batch element.
+            loglik_per_res: [B] per-residue log-likelihood averaged over K orders.
         """
         device = S.device
 
@@ -984,10 +979,9 @@ class Struct2SeqLO(nn.Module):
             log_p_x_given_z = (log_p_token * mask).sum(-1)
             log_terms.append(log_p_x_given_z)
 
-        log_terms_stack = torch.stack(log_terms, dim=0)
-        log_p_x_given_s = torch.logsumexp(log_terms_stack, dim=0) - float(np.log(K_eval))
-        loglik_per_res = log_p_x_given_s / L_tensor
-        return loglik_per_res
+        log_terms_stack = torch.stack(log_terms, dim=0)  # [K, B]
+        loglik_mean = log_terms_stack.mean(dim=0)
+        return loglik_mean / L_tensor
 
     # ------------------------------------------------------------------
     # q-based importance sampling estimate of log p_theta(x | s)
