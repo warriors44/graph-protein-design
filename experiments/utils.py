@@ -190,11 +190,21 @@ def get_args():
         '--order_mode',
         type=str,
         default='fix_order',
-        choices=['fix_order', 'any_order', 'learning_order'],
+        choices=['fix_order', 'any_order', 'learning_order', 'entropy', 'burial'],
         help=(
             'Decoding order mode for redesign sampling scripts. '
-            "AO supports: fix_order, any_order. "
-            "LO supports: learning_order, fix_order, any_order."
+            "AO supports: fix_order, any_order, entropy, burial. "
+            "LO supports: learning_order, fix_order, any_order, entropy, burial."
+        ),
+    )
+    parser.add_argument(
+        '--order_temperature',
+        type=float,
+        default=1.0,
+        help=(
+            'Temperature for entropy/burial order selection. '
+            'Lower → greedier (most certain / most buried first), '
+            'higher → more random.'
         ),
     )
     args = parser.parse_args()
@@ -482,3 +492,44 @@ def write_redesign_recovery_stat_txt(base_folder, df):
 
     with open(path, "w") as f:
         f.write("\n".join(lines) + "\n")
+
+
+def compute_burial_logits(
+    X: torch.Tensor,
+    mask: torch.Tensor,
+    tau: float = 2.0,
+    k_neighbors: int = 8,
+) -> torch.Tensor:
+    """Compute per-position order logits from Ca burial depth.
+
+    Buried residues (small average Ca-Ca distance to nearest neighbours)
+    receive higher logits, biasing the ordering toward
+    "decode buried residues first".
+
+    Args:
+        X: atom coordinates [B, N, 4, 3] (N, Ca, C, O order).
+        mask: padding mask [B, N], 1 = valid.
+        tau: temperature scaling for the prior.
+        k_neighbors: number of nearest Ca neighbours to average over.
+
+    Returns:
+        logits: [B, N] with padding positions set to -inf.
+    """
+    ca = X[:, :, 1, :]
+    dists = torch.cdist(ca, ca)
+
+    large_val = dists.max().detach() + 1.0
+    mask_2d = mask.unsqueeze(1) * mask.unsqueeze(2)
+    dists = dists + (1.0 - mask_2d) * large_val
+
+    eye = torch.eye(dists.size(1), device=dists.device, dtype=dists.dtype)
+    dists = dists + eye.unsqueeze(0) * large_val
+
+    k = min(k_neighbors, int(mask.sum(-1).min().item()) - 1)
+    k = max(k, 1)
+    topk_dists, _ = dists.topk(k, dim=-1, largest=False)
+    burial_score = topk_dists.mean(dim=-1)
+
+    logits = -burial_score / tau
+    logits = logits.masked_fill(mask == 0, float('-inf'))
+    return logits

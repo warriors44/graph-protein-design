@@ -4,6 +4,8 @@ This script mirrors `experiments/test_redesign.py`, but targets the AO-ARM model
 (`--model_type structure_ao`) and allows choosing the decoding permutation:
   - fix_order: deterministic N->C (0..N-1) order (valid residues first)
   - any_order: random permutation over valid residues (mask==1)
+  - entropy:   decode in order of decreasing prediction certainty (Eq. 14)
+  - burial:    decode buried residues first (Plackett-Luce with burial logits)
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
+from typing import Any
 
 if any(a in ("-h", "--help") for a in sys.argv):
     print(
@@ -29,7 +32,8 @@ if any(a in ("-h", "--help") for a in sys.argv):
                 "  --file_data <jsonl>         Dataset jsonl",
                 "  --file_splits <json>        Splits json (must contain 'test')",
                 "  --batch_tokens <int>        Batch size in tokens",
-                "  --order_mode {fix_order,any_order}",
+                "  --order_mode {fix_order,any_order,entropy,burial}",
+                "  --order_temperature <float> Temperature for entropy/burial ordering",
                 "",
                 "Note: Full argument parsing is provided by experiments/utils.py.",
             ]
@@ -40,12 +44,14 @@ if any(a in ("-h", "--help") for a in sys.argv):
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.distributions import Categorical
 
-# Library code
 sys.path.insert(0, "..")
 from struct2seq import data, struct2seq_ao
+from struct2seq.gumbel import gumbel_top_k
 
 from utils import (
+    compute_burial_logits,
     featurize,
     get_args,
     load_checkpoint,
@@ -63,7 +69,8 @@ except ModuleNotFoundError:  # pragma: no cover
 class OrderConfig:
     """Configuration for decoding permutation selection."""
 
-    mode: str  # "fix_order" | "any_order"
+    mode: str  # "fix_order" | "any_order" | "entropy" | "burial"
+    order_temperature: float = 1.0
 
 
 def _scores(
@@ -130,7 +137,6 @@ def _sample_with_permutation_ao(
     temperature: float,
 ) -> torch.Tensor:
     """Sample a sequence using a fixed full permutation via partial AR masks."""
-    # Encode once
     h_V_enc, h_E, E_idx, _ = model._encode(X, lengths, mask)  # type: ignore[attr-defined]
 
     B, N = mask.shape
@@ -151,12 +157,7 @@ def _sample_with_permutation_ao(
 
         ar_mask = model._build_partial_ar_mask(E_idx, full_perm, i_samples)  # type: ignore[attr-defined]
         log_probs, _ = model.forward_p(  # type: ignore[attr-defined]
-            h_V_enc,
-            h_E,
-            E_idx,
-            S,
-            mask,
-            ar_mask=ar_mask,
+            h_V_enc, h_E, E_idx, S, mask, ar_mask=ar_mask,
         )
 
         pos = full_perm[:, step - 1]
@@ -171,9 +172,113 @@ def _sample_with_permutation_ao(
     return S
 
 
+def _sample_with_entropy_order(
+    model: torch.nn.Module,
+    X: torch.Tensor,
+    lengths: np.ndarray,
+    mask: torch.Tensor,
+    token_temperature: float,
+    order_temperature: float,
+) -> torch.Tensor:
+    """Sample a sequence by adaptively choosing the next position via entropy.
+
+    At each step, compute the token distribution for all remaining positions,
+    then select the next position by sampling from a Categorical over
+    negative-entropy logits (positions with lower entropy are preferred).
+    """
+    h_V_enc, h_E, E_idx, _ = model._encode(X, lengths, mask)  # type: ignore[attr-defined]
+
+    B, N = mask.shape
+    device = X.device
+    S = torch.zeros((B, N), dtype=torch.long, device=device)
+    decoded = torch.zeros((B, N), dtype=torch.bool, device=device)
+    decoded[mask == 0] = True
+
+    valid_L = mask.sum(-1).long()
+    max_steps = int(valid_L.max().item()) if int(B) > 0 else 0
+    batch_idx_all = torch.arange(B, device=device)
+
+    ordering = torch.zeros((B, N), dtype=torch.long, device=device)
+
+    for step in range(max_steps):
+        remaining = ~decoded
+        if not remaining.any():
+            break
+
+        i_samples = decoded.long().sum(-1) - (mask == 0).long().sum(-1) + 1
+        i_samples = i_samples.clamp(min=1)
+
+        current_perm = _build_perm_from_decoded(ordering, step, mask)
+        ar_mask = model._build_partial_ar_mask(E_idx, current_perm, i_samples)  # type: ignore[attr-defined]
+        log_probs, _ = model.forward_p(  # type: ignore[attr-defined]
+            h_V_enc, h_E, E_idx, S, mask, ar_mask=ar_mask,
+        )
+
+        probs = log_probs.exp()
+        entropy = -(probs * log_probs).sum(-1)  # [B, N]
+
+        h = -entropy
+        h[decoded] = float('-inf')
+        h = h / order_temperature
+
+        next_pos = Categorical(logits=h).sample()  # [B]
+
+        token_logits = log_probs[batch_idx_all, next_pos, :] / float(token_temperature)
+        token_probs = F.softmax(token_logits, dim=-1)
+        sampled = torch.multinomial(token_probs, 1).squeeze(-1)
+
+        active = remaining[batch_idx_all, next_pos]
+        S[batch_idx_all[active], next_pos[active]] = sampled[active]
+        decoded[batch_idx_all, next_pos] = True
+        ordering[:, step] = next_pos
+
+    return S
+
+
+def _build_perm_from_decoded(
+    ordering: torch.Tensor,
+    num_decoded: int,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    """Build a full [B, N] permutation from partial ordering for AR mask.
+
+    First `num_decoded` columns come from ordering; remaining positions are
+    appended in arbitrary order (they won't affect the AR mask for decoded
+    positions).
+    """
+    B, N = mask.shape
+    device = mask.device
+    perm = torch.zeros((B, N), dtype=torch.long, device=device)
+
+    if num_decoded > 0:
+        perm[:, :num_decoded] = ordering[:, :num_decoded]
+
+    for b in range(B):
+        decoded_set = set(ordering[b, :num_decoded].tolist()) if num_decoded > 0 else set()
+        remaining = [j for j in range(N) if j not in decoded_set]
+        if remaining:
+            perm[b, num_decoded:] = torch.tensor(remaining, dtype=torch.long, device=device)
+
+    return perm
+
+
 def _similarity(seq1: str, seq2: str) -> float:
     matches = sum(c1 == c2 for c1, c2 in zip(seq1, seq2))
     return float(matches) / float(len(seq1))
+
+
+def _make_order_folder_suffix(order_cfg: OrderConfig) -> str:
+    """Build folder name suffix encoding order_mode and order_temperature."""
+    mode_map: dict[str, str] = {
+        "fix_order": "fo",
+        "any_order": "ao",
+        "entropy": "entropy",
+        "burial": "burial",
+    }
+    prefix = mode_map.get(order_cfg.mode, order_cfg.mode)
+    if order_cfg.mode in ("entropy", "burial"):
+        return f"{prefix}_t{order_cfg.order_temperature:g}"
+    return prefix
 
 
 def main() -> None:
@@ -208,35 +313,35 @@ def main() -> None:
 
     load_checkpoint(args.restore, model)
 
-    # Local CLI extension (keeps experiments/utils.py stable)
-    if not hasattr(args, "order_mode"):
-        # argparse in utils.py is used; for compatibility with older args.json
-        pass
-
     order_mode = getattr(args, "order_mode", "fix_order")
-    if order_mode not in ("fix_order", "any_order"):
-        raise ValueError("--order_mode must be 'fix_order' or 'any_order' for AO.")
-    order_cfg = OrderConfig(mode=str(order_mode))
+    order_temperature = float(getattr(args, "order_temperature", 1.0))
+    if order_mode not in ("fix_order", "any_order", "entropy", "burial"):
+        raise ValueError(
+            f"--order_mode must be fix_order/any_order/entropy/burial for AO, got {order_mode!r}"
+        )
+    order_cfg = OrderConfig(mode=str(order_mode), order_temperature=order_temperature)
 
-    order_prefix="ao" if order_cfg.mode == "any_order" else "fo" if order_cfg.mode == "fix_order" else "lo"
-    # Load test set
-    with open(args.file_splits) as f:
-        dataset_splits = json.load(f)
-    test_names: list[str] = dataset_splits["test"]
-    dataset = data.StructureDataset(args.file_data, truncate=None, max_length=500)
-    dataset_indices = {d["name"]: i for i, d in enumerate(dataset)}
-    test_set = torch.utils.data.Subset(dataset, [dataset_indices[name] for name in test_names])
-    print("Testing {} domains".format(len(test_set)))
-
-    # Output folders
+    folder_suffix = _make_order_folder_suffix(order_cfg)
     if args.name != '':
-        base_folder = 'log/' + args.name + '/' + order_prefix + '_cath' + '/'
+        base_folder = 'log/' + args.name + '/' + folder_suffix + '_cath' + '/'
     else:
-        base_folder = time.strftime("test/%y%b%d_%I%M%p/" + order_prefix + "_cath" + "/", time.localtime())
+        base_folder = time.strftime(
+            "test/%y%b%d_%I%M%p/" + folder_suffix + "_cath" + "/",
+            time.localtime(),
+        )
     os.makedirs(base_folder, exist_ok=True)
     os.makedirs(base_folder + "alignments", exist_ok=True)
     with open(base_folder + "/hyperparams.json", "w") as f:
         json.dump(vars(args), f)
+
+    with open(args.file_splits) as f:
+        dataset_splits: dict[str, Any] = json.load(f)
+    test_names: list[str] = dataset_splits["test"]
+    dataset = data.StructureDataset(args.file_data, truncate=None, max_length=500)
+    dataset_indices = {d["name"]: i for i, d in enumerate(dataset)}
+    test_set = torch.utils.data.Subset(dataset, [dataset_indices[name] for name in test_names])
+    print(f"Testing {len(test_set)} domains | order_mode={order_mode} "
+          f"| order_temperature={order_temperature}")
 
     BATCH_COPIES = 50
     NUM_BATCHES = 1
@@ -251,7 +356,6 @@ def main() -> None:
             batch_clones = [copy.deepcopy(protein) for _ in range(BATCH_COPIES)]
             X, S_native, mask, lengths = featurize(batch_clones, device)
 
-            # Native score under fixed N->C evaluation forward (matches existing script)
             log_probs_native = model(X, S_native, lengths, mask)
             native_score = float(_scores(S_native, log_probs_native, mask).cpu().numpy()[0])
 
@@ -262,20 +366,39 @@ def main() -> None:
 
                 for temp in temperatures:
                     for _ in range(NUM_BATCHES):
-                        full_perm = _make_full_permutation(mask, order_cfg)
-                        S_sample = _sample_with_permutation_ao(
-                            model=model,
-                            X=X,
-                            lengths=lengths,
-                            mask=mask,
-                            full_perm=full_perm,
-                            temperature=float(temp),
-                        )
-                        permutation_used = full_perm
+                        if order_cfg.mode == "entropy":
+                            S_sample = _sample_with_entropy_order(
+                                model=model,
+                                X=X,
+                                lengths=lengths,
+                                mask=mask,
+                                token_temperature=float(temp),
+                                order_temperature=order_cfg.order_temperature,
+                            )
+                        elif order_cfg.mode == "burial":
+                            burial_h = compute_burial_logits(X, mask, tau=1.0)
+                            burial_h = burial_h / order_cfg.order_temperature
+                            full_perm = gumbel_top_k(burial_h)
+                            S_sample = _sample_with_permutation_ao(
+                                model=model,
+                                X=X,
+                                lengths=lengths,
+                                mask=mask,
+                                full_perm=full_perm,
+                                temperature=float(temp),
+                            )
+                        else:
+                            full_perm = _make_full_permutation(mask, order_cfg)
+                            S_sample = _sample_with_permutation_ao(
+                                model=model,
+                                X=X,
+                                lengths=lengths,
+                                mask=mask,
+                                full_perm=full_perm,
+                                temperature=float(temp),
+                            )
 
-                        log_probs_sample = model(
-                            X, S_sample, lengths, mask, permutation=permutation_used,
-                        )
+                        log_probs_sample = model(X, S_sample, lengths, mask)
                         scores = _scores(S_sample, log_probs_sample, mask).cpu().numpy()
 
                         for b_ix in range(BATCH_COPIES):
@@ -291,7 +414,6 @@ def main() -> None:
                     frac_recovery = torch.sum(mask * (S_native.eq(S_sample).float())) / torch.sum(mask)
                     print(float(frac_recovery.cpu().numpy()))
 
-    # Aggregate results (same as test_redesign.py)
     if pd is None:
         print("pandas is not installed; skipping results aggregation and plots.")
         return
